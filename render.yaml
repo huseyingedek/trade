@@ -1,0 +1,44 @@
+# Render Blueprint – Tradepilo API
+# Render panelinde: New → Blueprint → bu repoyu seçin.
+# NOT: Binance/Bybit ABD IP'lerini engeller → bölge MUTLAKA Avrupa (frankfurt) olmalı.
+# NOT: Ücretsiz plan 15 dk boşta kalınca uyur; arka plan işleri (emir motoru, botlar,
+#      kurallar) durur. En az "starter" plan gerekir. Tek instance çalıştırın.
+services:
+  - type: web
+    name: tradepilo-api
+    runtime: node
+    region: frankfurt
+    plan: starter
+    numInstances: 1
+    buildCommand: npm ci
+    startCommand: npm run start:prod
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: LIVE_TRADING_ENABLED
+        value: "false"
+      - key: PAYMENTS_MODE
+        value: disabled
+      - key: SEED_DEMO
+        value: "false"
+      - key: SEED_ADMIN_EMAIL
+        sync: false
+      - key: SEED_ADMIN_PASSWORD
+        sync: false

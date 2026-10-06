@@ -1,0 +1,26 @@
+# Geliştirme için PostgreSQL 16
+#   docker compose up -d        → başlat
+#   docker compose down         → durdur (veri korunur)
+#   docker compose down -v      → durdur ve veriyi SİL
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tradenest-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tradenest
+      POSTGRES_PASSWORD: tradenest
+      POSTGRES_DB: tradenest
+      TZ: Europe/Istanbul
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tradenest -d tradenest"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

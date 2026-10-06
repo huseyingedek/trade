@@ -1,0 +1,44 @@
+{
+  "name": "tradenest-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Tradepilo – çoklu borsa yönetim platformu backend (Node.js + Fastify + Prisma + PostgreSQL)",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "start": "node --env-file-if-exists=.env src/server.js",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:seed": "node --env-file-if-exists=.env prisma/seed.js",
+    "db:reset": "prisma migrate reset --force",
+    "db:studio": "prisma studio",
+    "setup": "npm run db:generate && npm run db:deploy && npm run db:seed",
+    "test": "node --test test/lib.test.js",
+    "init": "node scripts/init-env.js",
+    "smoke": "node --env-file-if-exists=.env scripts/smoke.js",
+    "postinstall": "prisma generate",
+    "start:prod": "prisma migrate deploy && node prisma/seed.js && node src/server.js",
+    "test:algo": "node --test --test-concurrency=1 test/algorithms.test.js"
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.3.0",
+    "@fastify/helmet": "^13.1.1",
+    "@fastify/rate-limit": "^11.2.0",
+    "@fastify/websocket": "^11.3.3",
+    "@prisma/adapter-pg": "^7.10.0",
+    "@prisma/client": "^7.10.0",
+    "bcryptjs": "^3.0.3",
+    "ccxt": "^4.5.85",
+    "fastify": "^5.12.5",
+    "jsonwebtoken": "^9.0.3",
+    "otplib": "^13.5.0",
+    "pg": "^8.23.1",
+    "prisma": "^7.10.0",
+    "qrcode": "^1.5.4",
+    "zod": "^4.6.5"
+  }
+}
