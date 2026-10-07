@@ -7,7 +7,7 @@ Frontend: `../hirenest-admin`. API sözleşmesi: `../hirenest-admin/docs/API.md`
 
 ---
 
-> **Sunucuya dağıtım:** [DEPLOY.md](DEPLOY.md) (Render + Neon + Vercel, adım adım)
+> **Sunucuya dağıtım:** [DEPLOY-HETZNER.md](DEPLOY-HETZNER.md) – tek sunucu (Hetzner) + Neon, önerilen · alternatif: [DEPLOY.md](DEPLOY.md) (Render + Vercel)
 
 ## Hızlı kurulum (Windows)
 

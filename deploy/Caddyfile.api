@@ -1,0 +1,35 @@
+# Tradepilo – Caddy, SADECE backend (frontend Vercel'de)
+# __DOMAIN__ deploy.sh tarafından değiştirilir (örn. api.tradepilo.com)
+__DOMAIN__ {
+	encode zstd gzip
+
+	@backend path /api/* /ws
+	handle @backend {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle {
+		respond "Not found" 404
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Cache-Control "no-store"
+		-Server
+	}
+
+	log {
+		output file /var/log/caddy/tradepilo.log {
+			roll_size 20mb
+			roll_keep 5
+		}
+		# WebSocket adresindeki oturum anahtarı (?token=…) log'a yazılmasın
+		format filter {
+			request>uri query {
+				replace token REDACTED
+			}
+		}
+	}
+}

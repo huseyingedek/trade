@@ -1,0 +1,17 @@
+# /etc/tradepilo/deploy.conf
+#
+# SEÇENEK A – Frontend Vercel'de, sunucuda sadece backend (şu anki kurulum):
+#   DOMAIN=api.tradepilo.com   (DNS: A kaydı "api" → sunucu IP)
+#   WEB_REPO boş bırakılır
+#
+# SEÇENEK B – Her şey bu sunucuda:
+#   DOMAIN=tradepilo.com       (DNS: A kaydı "@" → sunucu IP)
+#   WEB_REPO=git@github-web:KULLANICI_ADI/tradepilo-web.git
+#
+# Alan adı henüz yönlenmediyse geçici olarak:  <IP-tirelerle>.sslip.io  (örn. 116-203-10-20.sslip.io)
+DOMAIN=api.tradepilo.com
+
+# GitHub repoları – setup-server.sh'ın oluşturduğu ssh takma adlarıyla (github-api / github-web)
+API_REPO=git@github-api:KULLANICI_ADI/tradepilo-api.git
+WEB_REPO=
+BRANCH=main

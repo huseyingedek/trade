@@ -13,6 +13,13 @@ import userRoutes from './routes/user.js'
 import adminRoutes from './routes/admin.js'
 import wsRoutes from './realtime/ws.js'
 
+// "https://site.com/", tırnaklı veya boşluklu girilen adresleri de doğru eşleştir
+export function corsOrigins() {
+  return config.CORS_ORIGIN.split(',')
+    .map((s) => s.trim().replace(/^['"]|['"]$/g, '').replace(/\/+$/, ''))
+    .filter(Boolean)
+}
+
 export async function buildApp(opts = {}) {
   const app = Fastify({
     logger: opts.logger ?? {
@@ -34,7 +41,7 @@ export async function buildApp(opts = {}) {
 
   await app.register(helmet, { contentSecurityPolicy: false })
   await app.register(cors, {
-    origin: config.CORS_ORIGIN === '*' ? true : config.CORS_ORIGIN.split(',').map((s) => s.trim()),
+    origin: config.CORS_ORIGIN === '*' ? true : corsOrigins(),
     methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
     credentials: false,
   })

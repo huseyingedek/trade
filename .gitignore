@@ -2,3 +2,13 @@ node_modules/
 .env
 *.log
 .DS_Store
+
+# güncelleme paketleri ve gizli dosyalar
+*.zip
+.env.*
+!.env.example
+node_modules
+dist
+.sandbox
+deploy/api.env
+deploy/deploy.conf

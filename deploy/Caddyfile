@@ -1,0 +1,45 @@
+# Tradepilo – Caddy (otomatik HTTPS / Let's Encrypt)
+# __DOMAIN__ deploy.sh tarafından gerçek alan adıyla değiştirilir.
+__DOMAIN__ {
+	encode zstd gzip
+
+	# API ve WebSocket → backend (sadece sunucu içinden erişilebilir: 127.0.0.1:8080)
+	@backend path /api/* /ws
+	handle @backend {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# Frontend (tek sayfa uygulama: bilinmeyen yollar index.html'e)
+	handle {
+		root * /var/www/tradepilo
+		try_files {path} /index.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		-Server
+	}
+	# derlenmiş dosyalar (adında hash var) uzun süre önbellekte kalabilir; geri kalan her zaman taze
+	@immutable path /assets/*
+	header @immutable Cache-Control "public, max-age=31536000, immutable"
+	@fresh not path /assets/*
+	header @fresh Cache-Control "no-cache"
+
+	log {
+		output file /var/log/caddy/tradepilo.log {
+			roll_size 20mb
+			roll_keep 5
+		}
+		# WebSocket adresindeki oturum anahtarı (?token=…) log'a yazılmasın
+		format filter {
+			request>uri query {
+				replace token REDACTED
+			}
+		}
+	}
+}

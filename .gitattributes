@@ -1,0 +1,5 @@
+# Sunucuda (Linux) çalışan dosyalar her zaman LF satır sonu ile kalsın
+*.sh       text eol=lf
+*.service  text eol=lf
+Caddyfile  text eol=lf
+*.example  text eol=lf

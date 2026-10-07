@@ -2,7 +2,7 @@
 //  Tradepilo API – giriş noktası
 // =====================================================================
 import { config } from './config.js'
-import { buildApp } from './app.js'
+import { buildApp, corsOrigins } from './app.js'
 import { prisma } from './lib/prisma.js'
 import { feed } from './market/feed.js'
 import { startJobs, stopJobs } from './jobs/scheduler.js'
@@ -26,6 +26,7 @@ await feed.start()
 startJobs()
 await app.listen({ host: config.HOST, port: config.PORT })
 app.log.info(`🚀 Tradepilo API hazır → port ${config.PORT}  ·  REST /api/v1  ·  WebSocket /ws`)
+app.log.info(`   CORS izinli adresler: ${config.CORS_ORIGIN === '*' ? '*' : corsOrigins().join(' , ')}`)
 app.log.info(`   Canlı işlem: ${config.LIVE_TRADING_ENABLED ? 'AÇIK ⚠️' : 'kapalı (paper mod)'} · Piyasa verisi: ${config.MARKET_DATA}`)
 
 let closing = false
