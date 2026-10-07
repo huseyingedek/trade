@@ -50,7 +50,9 @@ class MarketFeed extends EventEmitter {
     if (config.MARKET_DATA === 'auto') {
       const Cls = ccxt[config.MARKET_DATA_EXCHANGE]
       if (Cls) this.ccxt = createMarketDataClient(Cls)
-      this.pollLoop()
+      // Binance: fiyatlar WebSocket akışından (REST istek limiti/paylaşılan IP sorunu yok)
+      if (this.ccxt?.id === 'binance' && typeof WebSocket === 'function') this.binanceStreamLoop()
+      else this.pollLoop()
     }
     if (config.FX_REFERENCE) this.fxLoop()
     this.timers = [setInterval(() => this.simTick(), 1000), setInterval(() => this.publish(), 1000)]
@@ -123,6 +125,83 @@ class MarketFeed extends EventEmitter {
         this.ccxtOk = false
         backoff = Math.min(60_000, (backoff || 5000) * 2)
         await sleep(backoff)
+      }
+    }
+  }
+
+  /**
+   * Binance WebSocket ticker akışı (<sembol>@ticker, saniyede 1 güncelleme).
+   * REST "request weight" limitine takılmaz. Bağlantı koparsa artan bekleme ile yeniden bağlanır;
+   * Binance bağlantıları 24 saatte bir kapattığı için bu normaldir. Enstrüman listesi değişirse yeniden abone olur.
+   */
+  async binanceStreamLoop() {
+    const HOSTS = ['wss://data-stream.binance.vision', 'wss://stream.binance.com:9443']
+    let attempt = 0
+    while (this.running) {
+      const live = [...this.instruments.values()].filter((i) => this.usesExternal(i))
+      if (!live.length) {
+        await sleep(5000)
+        continue
+      }
+      const map = new Map(live.map((i) => [String(i.sourceSymbol || i.symbol).replace('/', '').toUpperCase(), i.symbol]))
+      const key = [...map.keys()].sort().join(',')
+      const url = `${HOSTS[attempt % HOSTS.length]}/stream?streams=${[...map.keys()].map((k) => `${k.toLowerCase()}@ticker`).join('/')}`
+      const startedAt = Date.now()
+      let gotData = false
+      await new Promise((resolve) => {
+        let ws
+        const done = () => {
+          clearInterval(watch)
+          try { ws?.close() } catch { /* zaten kapalı */ }
+          resolve()
+        }
+        // veri gelmiyorsa / liste değiştiyse / durdurulduysa bağlantıyı yenile
+        const watch = setInterval(() => {
+          const nowKey = [...this.instruments.values()].filter((i) => this.usesExternal(i)).map((i) => String(i.sourceSymbol || i.symbol).replace('/', '').toUpperCase()).sort().join(',')
+          const silent = Date.now() - (this.lastStreamAt || startedAt) > 30_000
+          if (!this.running || nowKey !== key || silent) done()
+        }, 5000)
+        try {
+          ws = new WebSocket(url)
+        } catch (e) {
+          log.warn(`⚠️  Binance akışı açılamadı: ${e.message}`)
+          return done()
+        }
+        ws.onmessage = (ev) => {
+          let msg
+          try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString()) } catch { return }
+          const t = msg?.data
+          if (!t || t.e !== '24hrTicker') return
+          const symbol = map.get(t.s)
+          const st = symbol && this.state.get(symbol)
+          if (!st) return
+          const last = +t.c
+          if (!(last > 0)) return
+          Object.assign(st, {
+            last, open: +t.o || st.open, high: +t.h || Math.max(st.high, last), low: +t.l || Math.min(st.low, last),
+            volume: +t.q || st.volume, bid: +t.b || last, ask: +t.a || last,
+            ts: Date.now(), source: 'live', liveAt: Date.now(),
+          })
+          this.lastStreamAt = Date.now()
+          if (!gotData) {
+            gotData = true
+            attempt = 0
+            if (!this.ccxtOk) log.info(`✅ Gerçek kripto fiyatları alınıyor (binance WebSocket, ${map.size} sembol)`)
+          }
+          this.ccxtOk = true
+        }
+        ws.onerror = () => {}
+        ws.onclose = () => done()
+      })
+      if (!this.running) break
+      this.lastStreamAt = 0
+      if (!gotData) {
+        if (this.ccxtOk || attempt === 0) log.warn('⚠️  Binance fiyat akışına bağlanılamadı – son gerçek fiyatlar korunuyor, tekrar denenecek')
+        this.ccxtOk = false
+        attempt++
+        await sleep(Math.min(60_000, 2000 * 2 ** Math.min(attempt, 5)))
+      } else {
+        await sleep(1000) // normal yeniden bağlanma (24 saat sınırı / liste değişti)
       }
     }
   }

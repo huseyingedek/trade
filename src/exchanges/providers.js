@@ -46,6 +46,7 @@ export const PROVIDERS = [
     features: { spot: true, futures: false, short: true, oco: true, trailing: true },
     fields: [{ key: 'accountId', label: 'Hesap ID', type: 'text' }, { key: 'apiKey', label: 'API Token', type: 'password' }],
     healthUrl: 'https://api-fxtrade.oanda.com',
+    healthAuthRequired: true, // anahtarsız istek 401/403 döner – bu, sunucunun ayakta olduğunu gösterir
     note: 'Bağlantı testi gerçek OANDA v20 API ile yapılır; emirler şimdilik paper modda simüle edilir.',
   },
   {
@@ -59,7 +60,7 @@ export const PROVIDERS = [
 export const providerById = Object.fromEntries(PROVIDERS.map((p) => [p.id, p]))
 
 /** İstemciye gönderilen görünüm (iç alanlar hariç) */
-export const providerView = ({ healthUrl, ...p }) => (void healthUrl, p)
+export const providerView = ({ healthUrl, healthAuthRequired, ...p }) => (void healthUrl, void healthAuthRequired, p)
 
 /** Hesap türüne göre nakit para birimi */
 export const ACCOUNT_CCY = { crypto: 'USDT', bist: 'TRY', forex: 'USD' }
