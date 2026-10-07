@@ -21,7 +21,7 @@ import { connToApi } from './exchanges.js'
 import { PROVIDERS, providerById } from '../exchanges/providers.js'
 import { health } from '../exchanges/health.js'
 import { feed } from '../market/feed.js'
-import { positionMetrics } from '../trading/portfolio.js'
+import { positionMetrics, valueOf } from '../trading/portfolio.js'
 import { ruleToApi } from '../automation/rules.js'
 import { botToApi } from '../automation/bots.js'
 import { activityToApi } from './activity.js'
@@ -182,7 +182,12 @@ export async function overview() {
   const active24 = users.filter((u) => u.lastActiveAt && u.lastActiveAt.getTime() > now - DAY).length
   const new7 = users.filter((u) => u.createdAt.getTime() > now - 7 * DAY).length
   const new7prev = users.filter((u) => u.createdAt.getTime() > now - 14 * DAY && u.createdAt.getTime() <= now - 7 * DAY).length
-  const paid = users.filter((u) => num(planMap[u.planId]?.priceMonthly) > 0 && u.status !== 'pending')
+  // Gelir: sadece o plan için onaylanmış ödemesi olanlar. Admin'in ücretsiz verdiği ücretli planlar ("hediye") gelire sayılmaz.
+  const paidPayments = await prisma.payment.findMany({ where: { status: 'paid', user: USER_ROLE }, select: { userId: true, planId: true } })
+  const paidKeys = new Set(paidPayments.map((p) => `${p.userId}:${p.planId}`))
+  const onPaidPlan = users.filter((u) => num(planMap[u.planId]?.priceMonthly) > 0 && u.status !== 'pending')
+  const paid = onPaidPlan.filter((u) => paidKeys.has(`${u.id}:${u.planId}`))
+  const compUsers = onPaidPlan.length - paid.length
   const mrr = paid.reduce((a, u) => a + (u.billingCycle === 'yearly' ? num(planMap[u.planId].priceYearly) / 12 : num(planMap[u.planId].priceMonthly)), 0)
   const growth = Array.from({ length: 90 }, (_, i) => {
     const t = now - (89 - i) * DAY
@@ -206,19 +211,33 @@ export async function overview() {
     if (o.filledAt.getTime() > now - DAY) volume24h += usd
   }
   const healthList = await providersHealth(settings)
+  // Varlık: canlı (gerçek para) ve sanal (paper) ayrı
+  const [accByMode, allBalances, allPositions] = await Promise.all([
+    prisma.exchangeAccount.groupBy({ by: ['mode'], where: { user: USER_ROLE }, _count: true }),
+    prisma.balance.findMany({ where: { exchange: { user: USER_ROLE } }, include: { exchange: { select: { mode: true } } } }),
+    prisma.position.findMany({ where: { user: USER_ROLE }, include: { exchange: { select: { mode: true } } } }),
+  ])
+  const modeCount = (m) => accByMode.find((r) => r.mode === m)?._count ?? 0
+  const aumLiveUsd = valueOf({ balances: allBalances.filter((b) => b.exchange.mode === 'live'), positions: [] })
+  const aumPaperUsd = valueOf({ balances: allBalances.filter((b) => b.exchange.mode !== 'live'), positions: allPositions.filter((p) => p.exchange.mode !== 'live') })
   const totalAcc = healthList.reduce((a, h) => a + h.accounts, 0)
   return {
     kpis: {
       totalUsers: users.length,
       activeUsers24h: active24,
       newUsers7d: new7,
-      newUsers7dChangePct: new7prev ? ((new7 - new7prev) / new7prev) * 100 : 0,
+      newUsers7dChangePct: new7prev ? ((new7 - new7prev) / new7prev) * 100 : null,
       paidUsers: paid.length,
+      compUsers,
       conversionPct: users.length ? (paid.length / users.length) * 100 : 0,
       mrr: Math.round(mrr),
       currency: 'TRY',
       connectedAccounts,
-      aumUsd: users.reduce((a, u) => a + u.aumUsd, 0),
+      liveAccounts: modeCount('live'),
+      paperAccounts: modeCount('paper'),
+      aumUsd: aumLiveUsd + aumPaperUsd,
+      aumLiveUsd,
+      aumPaperUsd,
       volume24hUsd: volume24h,
       runningBots,
       activeRules,
