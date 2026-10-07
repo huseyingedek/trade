@@ -17,6 +17,22 @@ import { health } from '../exchanges/health.js'
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
+/**
+ * Sadece herkese açık piyasa verisi için ccxt istemcisi.
+ * Binance: bulut sunucularının paylaşılan IP'leri api.binance.com'da sık sık hız sınırına (429/418)
+ * takılır. Binance'in salt piyasa verisi için sunduğu data-api.binance.vision adresi kullanılır;
+ * gereksiz vadeli işlem piyasaları da yüklenmez. (Canlı emirler ayrı istemciyle api.binance.com'a gider.)
+ */
+export function createMarketDataClient(Cls) {
+  const ex = new Cls({ enableRateLimit: true, timeout: 10000 })
+  if (ex.id === 'binance') {
+    ex.urls.api.public = 'https://data-api.binance.vision/api/v3'
+    ex.options.fetchMarkets = ['spot']
+    ex.options.defaultType = 'spot'
+  }
+  return ex
+}
+
 class MarketFeed extends EventEmitter {
   constructor() {
     super()
@@ -33,7 +49,7 @@ class MarketFeed extends EventEmitter {
     await this.reload()
     if (config.MARKET_DATA === 'auto') {
       const Cls = ccxt[config.MARKET_DATA_EXCHANGE]
-      if (Cls) this.ccxt = new Cls({ enableRateLimit: true, timeout: 10000 })
+      if (Cls) this.ccxt = createMarketDataClient(Cls)
       this.pollLoop()
     }
     if (config.FX_REFERENCE) this.fxLoop()
@@ -103,7 +119,7 @@ class MarketFeed extends EventEmitter {
         await sleep(config.MARKET_POLL_MS)
       } catch (e) {
         health.record(config.MARKET_DATA_EXCHANGE, Date.now() - t0, false)
-        if (this.ccxtOk || backoff === 0) log.warn(`⚠️  ${config.MARKET_DATA_EXCHANGE} fiyatları alınamadı (${e.constructor?.name}): simülasyona geçildi, tekrar denenecek`)
+        if (this.ccxtOk || backoff === 0) log.warn(`⚠️  ${config.MARKET_DATA_EXCHANGE} fiyatları alınamadı (${e.constructor?.name}: ${String(e.message || '').slice(0, 160)}) – son gerçek fiyatlar korunuyor, tekrar denenecek`)
         this.ccxtOk = false
         backoff = Math.min(60_000, (backoff || 5000) * 2)
         await sleep(backoff)
@@ -140,6 +156,12 @@ class MarketFeed extends EventEmitter {
     for (const i of this.instruments.values()) {
       const s = this.state.get(i.symbol)
       if (s.source === 'live' && now - s.liveAt < 15_000) continue
+      // Gerçek kaynaktan en az bir kez fiyat geldiyse kaynak kesildiğinde rastgele fiyat ÜRETME:
+      // son gerçek fiyat sabit kalır ("stale"). Aksi halde emirler/stoplar uydurma fiyatlarla tetiklenirdi.
+      if (s.liveAt && this.usesExternal(i)) {
+        s.source = 'stale'
+        continue
+      }
       if (s.source === 'live') s.source = 'sim'
       const target = s.anchor ?? i.seedPrice
       const pull = s.anchor ? (target - s.last) / target / 300 : (target - s.last) / target / 5000
