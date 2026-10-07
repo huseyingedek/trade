@@ -32,8 +32,9 @@ class Health {
         let reason = null
         try {
           const res = await fetch(p.healthUrl, { signal: AbortSignal.timeout(8000) })
-          ok = res.status < 500
-          if (!ok) reason = `HTTP ${res.status}`
+          // 2xx/3xx = erişilebilir. 429 = hız sınırı (borsa ayakta). 451/403 = bölge engeli, 418 = IP yasağı → hata
+          ok = res.status < 400 || res.status === 429
+          if (!ok) reason = res.status === 451 || res.status === 403 ? `HTTP ${res.status} – sunucunun bölgesi engelli olabilir` : `HTTP ${res.status}`
         } catch (e) {
           ok = false
           reason = e.name === 'TimeoutError' ? 'zaman aşımı (8 sn)' : e.cause?.code || e.message
