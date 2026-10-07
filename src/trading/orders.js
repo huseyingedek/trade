@@ -151,6 +151,16 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
         const lockedAmt = await lockedCash(conn)
         if (feed.convert(marginQuote * (1 + config.TRADING_FEE_RATE), ins.quote, acct) > num(cash?.free ?? 0) - lockedAmt + 1e-9)
           throw unprocessable('Yetersiz bakiye', 'INSUFFICIENT_FUNDS')
+      } else {
+        // Canlı (spot) hesap: borsadan senkronlanan serbest bakiye (borsadaki açık emirler zaten düşülmüş)
+        const need = openingQty * refPrice * (1 + config.TRADING_FEE_RATE)
+        const minCost = LIVE_MIN_ORDER_QUOTE[conn.provider]
+        if (minCost && openingQty * refPrice < minCost)
+          throw badRequest(`Borsanın minimum emir tutarı yaklaşık ${minCost} ${ins.quote}. Bu emir ${roundTo(openingQty * refPrice, 0.01)} ${ins.quote}.`, 'MIN_NOTIONAL')
+        const bal = await prisma.balance.findUnique({ where: { exchangeId_asset: { exchangeId, asset: ins.quote } } })
+        const free = num(bal?.free ?? 0)
+        if (need > free + 1e-9)
+          throw unprocessable(`Yetersiz bakiye: borsa hesabınızda ${roundTo(free, 0.01)} ${ins.quote} var, bu emir için yaklaşık ${roundTo(need, 0.01)} ${ins.quote} gerekiyor`, 'INSUFFICIENT_FUNDS')
       }
       // 2) sonra pozisyon büyüklüğü limiti (bu emirden sonra pozisyonun toplam teminatı)
       const total = await totalValueUsd(userId)
@@ -193,6 +203,9 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
 const stripRel = ({ exchange, ...o }) => (void exchange, o)
 
 /** Bekleyen alış emirlerinin kilitlediği nakit (paper) */
+/** Canlı spot emirlerde borsaların yaklaşık minimum emir tutarı (quote para birimi cinsinden) */
+const LIVE_MIN_ORDER_QUOTE = { binance: 5 }
+
 export async function lockedCash(conn) {
   const open = await prisma.order.findMany({ where: { exchangeId: conn.id, status: 'open', side: 'buy' } })
   const acct = ACCOUNT_CCY[conn.market]
