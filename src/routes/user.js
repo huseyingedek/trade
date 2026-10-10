@@ -186,6 +186,7 @@ export default async function userRoutes(app) {
 
   // ================================================================ botlar
   app.get('/bots', trader, (req) => bots.listBots(req.user.id))
+  app.get('/bots/:id', trader, (req) => bots.getBotDetail(req.user.id, req.params.id))
   app.post('/bots', trader, (req) => bots.createBot(req.user.id, req.body || {}))
   app.post('/bots/:id/start', trader, (req) => bots.setStatus(req.user.id, req.params.id, 'running'))
   app.post('/bots/:id/pause', trader, (req) => bots.setStatus(req.user.id, req.params.id, 'paused'))

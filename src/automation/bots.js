@@ -76,6 +76,69 @@ export async function listBots(userId) {
   return (await prisma.bot.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } })).map(botToApi)
 }
 
+/**
+ * Bot detayı: anlık strateji durumu (ne tutuyor, sıradaki hedefler), bot emirleri ve olay günlüğü.
+ * Kullanıcı botun ne alıp sattığını ve neden beklediğini buradan izler.
+ */
+export async function getBotDetail(userId, id) {
+  const b = await prisma.bot.findFirst({ where: { id, userId } })
+  if (!b) throw notFound('Bot bulunamadı')
+  const [orders, activity] = await Promise.all([
+    prisma.order.findMany({
+      where: { userId, botId: id },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+      select: { id: true, side: true, type: true, qty: true, filledQty: true, avgPrice: true, fee: true, status: true, reason: true, createdAt: true, filledAt: true },
+    }),
+    prisma.activity.findMany({ where: { userId, botId: id }, orderBy: { ts: 'desc' }, take: 100, select: { id: true, ts: true, level: true, message: true } }),
+  ])
+  let price = null
+  try {
+    price = feed.last(b.symbol)
+  } catch {
+    /* fiyat yok */
+  }
+  const s = b.state || {}
+  const c = b.config || {}
+  const inv = num(b.investment)
+  const view = { price, realized: s.realized || 0, fees: s.fees || 0, unrealized: price ? unrealized(b, s, price) : 0, failures: s.failures || 0 }
+  if (b.strategy === 'dca') {
+    const qty = s.qty || 0
+    const cost = s.cost || 0
+    const avg = qty ? cost / qty : null
+    Object.assign(view, {
+      qty, cost, avgPrice: avg, buys: s.buys || 0, maxOrders: c.maxOrders,
+      takeProfitPrice: avg && c.takeProfitPct ? avg * (1 + c.takeProfitPct / 100) : null,
+      lastBuyAt: s.lastBuyAt ?? null,
+      nextBuyAt: s.lastBuyAt ? s.lastBuyAt + c.intervalHours * 3_600_000 : null,
+      budgetLeft: Math.max(0, inv - cost),
+    })
+  } else if (b.strategy === 'grid') {
+    const step = (c.upper - c.lower) / c.grids
+    const holdings = s.holdings || {}
+    const levels = Array.from({ length: c.grids }, (_, k) => {
+      const buy = c.lower + k * step
+      const h = holdings[k]
+      return { level: k + 1, buyPrice: buy, sellPrice: buy + step, holding: h ? { qty: h.qty, price: h.price } : null }
+    })
+    Object.assign(view, {
+      step, perGrid: inv / c.grids, levels,
+      inRange: price != null ? price >= c.lower && price <= c.upper : null,
+      qty: Object.values(holdings).reduce((a, h) => a + h.qty, 0),
+      filledLevels: Object.keys(holdings).length,
+    })
+  } else {
+    const peak = s.peak ?? null
+    Object.assign(view, {
+      qty: s.qty || 0, entryPrice: s.entry ?? null, peak,
+      stopPrice: peak ? peak * (1 - c.trailingPct / 100) : null,
+      takeProfitPrice: s.entry && c.takeProfitPct ? s.entry * (1 + c.takeProfitPct / 100) : null,
+      done: !!s.done,
+    })
+  }
+  return { bot: botToApi(b), view, orders: orders.map(toApi), activity: activity.map(toApi) }
+}
+
 export async function createBot(userId, body) {
   const u = await prisma.user.findUnique({ where: { id: userId }, include: { plan: true } })
   const used = await prisma.bot.count({ where: { userId } })
