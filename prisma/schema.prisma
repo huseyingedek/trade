@@ -499,6 +499,8 @@ model RiskSettings {
   /// gün başı portföy değeri (USD) ve gün anahtarı (YYYY-MM-DD)
   dayStartValue    Float?
   dayKey           String?
+  /// Gün başı değerleri gerçek (live) ve sanal (paper) hesaplar için AYRI: { key: 'YYYY-MM-DD', live?: number, paper?: number }
+  dayStartModes    Json?
   updatedAt        DateTime  @updatedAt
   user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
@@ -508,6 +510,9 @@ model PortfolioSnapshot {
   userId   String
   ts       DateTime @default(now())
   valueUsd Float
+  /// gerçek (live) ve sanal (paper) hesapların ayrı değerleri
+  liveUsd  Float?
+  paperUsd Float?
   user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, ts])

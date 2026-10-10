@@ -34,7 +34,8 @@ export async function buildApp(opts = {}) {
         }),
       },
     },
-    trustProxy: true,
+    // true (her proxy'ye güven) yerine adım sayısı: X-Forwarded-For sahteciliğine karşı
+    trustProxy: /^\d+$/.test(config.TRUST_PROXY.trim()) ? +config.TRUST_PROXY.trim() : config.TRUST_PROXY.split(',').map((s) => s.trim()).filter(Boolean),
     bodyLimit: 256 * 1024,
   })
   setLogger(app.log)

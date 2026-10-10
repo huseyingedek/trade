@@ -4,7 +4,7 @@
 import { prisma } from '../lib/prisma.js'
 import { dayKey } from '../lib/time.js'
 import { badRequest } from '../lib/errors.js'
-import { totalValueUsd, ensureDayStart } from './portfolio.js'
+import { totalValueUsd, ensureDayStart, setDayStart, riskScope } from './portfolio.js'
 import { cancelAll, closePosition, emitTrading } from './orders.js'
 import { logActivity } from '../services/activity.js'
 
@@ -12,8 +12,10 @@ export const getRisk = (userId) => prisma.riskSettings.upsert({ where: { userId 
 
 /** Gün başı değeri gerekirse yeniler; güncel durumu döndürür */
 export async function riskState(userId) {
-  const total = await totalValueUsd(userId)
-  const start = (await ensureDayStart(userId, total)) || total
+  // Günlük zarar limiti GERÇEK para üzerinden izlenir (canlı hesap yoksa sanal hesaplar). İkisi toplanmaz.
+  const scope = await riskScope(userId)
+  const total = await totalValueUsd(userId, scope)
+  const start = (await ensureDayStart(userId, total, scope)) || total
   const r = await getRisk(userId)
   const pct = start ? ((total - start) / start) * 100 : 0
   const [openOrders, runningBots, activeRules] = await Promise.all([
@@ -28,6 +30,7 @@ export async function riskState(userId) {
     maxOpenOrders: r.maxOpenOrders,
     requireConfirm: r.requireConfirm,
     state: {
+      scope, // 'live' | 'paper'
       totalValue: total,
       dayStartValue: start,
       dayPnl: total - start,
@@ -82,13 +85,15 @@ export async function setKillSwitch(userId, { active, reason, cancelOrders = fal
     }
     await logActivity(userId, { level: 'danger', source: 'risk', notify: true, message: `ACİL DURDURMA: ${reason || 'Manuel'} · ${paused.count} bot duraklatıldı · ${canceled} emir iptal · ${closed} pozisyon kapatıldı` })
   } else {
-    const total = await totalValueUsd(userId)
-    const r = await getRisk(userId)
+    const scope = await riskScope(userId)
+    const total = await totalValueUsd(userId, scope)
+    const start = await ensureDayStart(userId, total, scope)
     await prisma.riskSettings.update({
       where: { userId },
-      // gün başı değerini sıfırla ki günlük limit hemen tekrar tetiklenmesin
-      data: { killSwitchActive: false, killReason: null, killAt: null, killBy: null, dayStartValue: Math.min(r.dayStartValue ?? total, total * 1.0001) },
+      data: { killSwitchActive: false, killReason: null, killAt: null, killBy: null, dayStartValue: null, dayKey: null },
     })
+    // gün başı değerini güncel değere çek ki günlük limit hemen tekrar tetiklenmesin
+    await setDayStart(userId, scope, Math.min(start ?? total, total * 1.0001))
     await logActivity(userId, { level: 'success', source: 'risk', notify: true, message: 'İşlemler yeniden etkinleştirildi' })
   }
   emitTrading(userId, 'risk', 'bots', 'orders')
@@ -97,11 +102,15 @@ export async function setKillSwitch(userId, { active, reason, cancelOrders = fal
 
 /** Periyodik: günlük zarar limitini kontrol et (tüm kullanıcılar) */
 export async function checkDailyLoss() {
-  const list = await prisma.riskSettings.findMany({ where: { dailyLossEnabled: true, killSwitchActive: false, dayStartValue: { not: null } } })
+  const list = await prisma.riskSettings.findMany({ where: { dailyLossEnabled: true, killSwitchActive: false, dayStartModes: { not: null } } })
   for (const r of list) {
-    if (r.dayKey !== dayKey()) continue
-    const total = await totalValueUsd(r.userId)
-    const pct = ((total - r.dayStartValue) / r.dayStartValue) * 100
+    const d = r.dayStartModes
+    if (!d || d.key !== dayKey()) continue
+    const scope = await riskScope(r.userId)
+    const start = d[scope]
+    if (!(start > 0)) continue
+    const total = await totalValueUsd(r.userId, scope)
+    const pct = ((total - start) / start) * 100
     if (pct <= -Math.abs(r.dailyLossPct)) await setKillSwitch(r.userId, { active: true, reason: `Günlük zarar limiti (%${r.dailyLossPct}) aşıldı`, cancelOrders: true }, 'risk')
   }
 }

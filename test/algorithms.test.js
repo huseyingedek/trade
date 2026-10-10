@@ -490,3 +490,94 @@ test('günlük zarar limiti aşılınca otomatik acil durdurma', { skip }, async
   await checkDailyLoss()
   assert.equal((await prisma.riskSettings.findUnique({ where: { userId: user.id } })).killSwitchActive, true)
 })
+
+// ---------------------------------------------------------------- durdurmalar bekleyen emirleri de kapsar
+const statusOf = async (id) => (await prisma.order.findUnique({ where: { id } })).status
+
+test('acil durdurma (emirler iptal edilmeden): tetiklenen açılış emri bekler, pozisyon azaltan emir gerçekleşir', { skip }, async () => {
+  setPx('ETH/USDT', 3000)
+  const { user, spot } = await makeUser()
+  await placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'buy', type: 'market', qty: 1 })
+  const buy = await placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'buy', type: 'limit', qty: 0.1, price: 2900 })
+  const stop = await placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'sell', type: 'stop_market', qty: 0.5, stopPrice: 2950 })
+  await setKillSwitch(user.id, { active: true, reason: 'test' }, 'manual')
+  setPx('ETH/USDT', 2850)
+  await processOrders()
+  assert.equal(await statusOf(buy.id), 'open', 'yeni pozisyon açan emir durdurmada gerçekleşmemeli')
+  assert.equal(await statusOf(stop.id), 'filled', 'koruyucu (pozisyon azaltan) stop durdurmada da çalışmalı')
+  await setKillSwitch(user.id, { active: false }, 'manual')
+  await processOrders()
+  assert.equal(await statusOf(buy.id), 'filled', 'durdurma kalkınca emir yeniden değerlendirilir')
+})
+
+test('platform global durdurma ve kullanıcı durdurma bekleyen emirleri gerçekleştirmez', { skip }, async () => {
+  const { invalidatePlatform } = await import('../src/services/platform.js')
+  setPx('ETH/USDT', 3000)
+  const { user, spot } = await makeUser()
+  const buy = await placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'buy', type: 'limit', qty: 0.1, price: 2900 })
+  try {
+    await prisma.platformSetting.update({ where: { id: 1 }, data: { killSwitchActive: true, killReason: 'test' } })
+    invalidatePlatform()
+    setPx('ETH/USDT', 2850)
+    await processOrders()
+    assert.equal(await statusOf(buy.id), 'open')
+  } finally {
+    await prisma.platformSetting.update({ where: { id: 1 }, data: { killSwitchActive: false, killReason: null } })
+    invalidatePlatform()
+  }
+  await prisma.user.update({ where: { id: user.id }, data: { status: 'trading_halted' } })
+  await processOrders()
+  assert.equal(await statusOf(buy.id), 'open')
+  await prisma.user.update({ where: { id: user.id }, data: { status: 'active' } })
+  await processOrders()
+  assert.equal(await statusOf(buy.id), 'filled')
+  setPx('ETH/USDT', 3000)
+})
+
+test('bekleyen açığa satış emirleri teminat kilitler (aynı nakit iki kez kullanılamaz)', { skip }, async () => {
+  setPx('BTC/USDT', 60000)
+  const { user, fut } = await makeUser({ cash: 1000 })
+  // 5x kaldıraçla 0,05 BTC @ 61.000 = 3.050$ tutar → 610$ teminat
+  const first = await placeOrder(user.id, { exchangeId: fut.id, symbol: 'BTC/USDT', side: 'sell', type: 'limit', qty: 0.05, price: 61000, leverage: 5 })
+  assert.equal(first.status, 'open')
+  await assert.rejects(placeOrder(user.id, { exchangeId: fut.id, symbol: 'BTC/USDT', side: 'sell', type: 'limit', qty: 0.05, price: 61000, leverage: 5 }), /Yetersiz bakiye/)
+})
+
+test('geçersiz sayılar ve tutarsız SL/TP 400 ile reddedilir (500 değil)', { skip }, async () => {
+  setPx('ETH/USDT', 3000)
+  const { user, spot } = await makeUser()
+  await assert.rejects(placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'buy', type: 'limit', qty: 0.1, price: 'abc' }), (e) => e.status === 400)
+  await assert.rejects(placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'buy', type: 'market', qty: 0.1, stopLoss: 3100 }), /Zarar-kes/)
+  await assert.rejects(placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'buy', type: 'market', qty: 0.1, takeProfit: -5 }), (e) => e.status === 400)
+  const ok = await placeOrder(user.id, { exchangeId: spot.id, symbol: 'ETH/USDT', side: 'buy', type: 'market', qty: 0.1, stopLoss: 2800, takeProfit: 3300 })
+  assert.equal(ok.status, 'filled')
+})
+
+// ---------------------------------------------------------------- kimlik: e-posta değişikliği ve 2FA denemeleri
+test('e-posta değişikliği mevcut şifre olmadan yapılamaz; değişince doğrulama sıfırlanır', { skip }, async () => {
+  const bcrypt = (await import('bcryptjs')).default
+  const auth = await import('../src/services/auth.js')
+  const { user } = await makeUser()
+  await prisma.user.update({ where: { id: user.id }, data: { passwordHash: await bcrypt.hash('Sifre12345', 4), emailVerifiedAt: new Date() } })
+  const newEmail = `yeni-${Date.now()}@test.local`
+  await assert.rejects(auth.updateMe(user.id, { email: newEmail }), (e) => e.code === 'PASSWORD_REQUIRED')
+  await assert.rejects(auth.updateMe(user.id, { email: newEmail, currentPassword: 'yanlis' }), (e) => e.code === 'PASSWORD_REQUIRED')
+  // aynı e-posta + isim değişikliği şifresiz serbest
+  await auth.updateMe(user.id, { email: user.email, name: 'Yeni Ad' })
+  const me = await auth.updateMe(user.id, { email: newEmail, currentPassword: 'Sifre12345' })
+  assert.equal(me.email, newEmail)
+  assert.equal(me.emailVerified, false)
+})
+
+test('2FA: paralel denemeler 5 hakkı aşamaz', { skip }, async () => {
+  const auth = await import('../src/services/auth.js')
+  const { encrypt: enc } = await import('../src/lib/crypto.js')
+  const { newSecret } = await import('../src/lib/totp.js')
+  const { user } = await makeUser()
+  await prisma.user.update({ where: { id: user.id }, data: { twoFactorEnabled: true, twoFactorSecretEnc: enc(newSecret()) } })
+  const ch = await prisma.loginChallenge.create({ data: { userId: user.id, purpose: 'login', expiresAt: new Date(Date.now() + 60_000) } })
+  const res = await Promise.allSettled(Array.from({ length: 20 }, () => auth.verify2fa({ challengeId: ch.id, code: '123456' }, { ip: '1', ua: 't' })))
+  const wrong = res.filter((r) => r.status === 'rejected' && r.reason.code === 'INVALID_2FA').length
+  assert.ok(wrong <= 5, `en fazla 5 kod denenmeli, ${wrong} denendi`)
+  assert.equal((await prisma.loginChallenge.findUnique({ where: { id: ch.id } })).attempts, 5)
+})

@@ -55,7 +55,7 @@ export default async function userRoutes(app) {
   app.post('/auth/accept-invite', AUTH_LIMIT, (req) => auth.acceptInvite(req.body || {}))
 
   app.get('/auth/me', auth$, (req) => auth.meView(req.user.id))
-  app.patch('/auth/me', auth$, (req) => auth.updateMe(req.user.id, req.body || {}))
+  app.patch('/auth/me', auth$, (req) => auth.updateMe(req.user.id, req.body || {}, req.sessionId))
   app.post('/auth/logout', auth$, (req) => auth.logout(req.sessionId))
   app.post('/auth/delete-account', { ...AUTH_LIMIT, preHandler: requireAuth }, (req) => auth.deleteAccount(req.user.id, req.body || {}))
   app.post('/auth/change-password', auth$, (req) => auth.changePassword(req.user.id, req.sessionId, req.body || {}))
@@ -174,8 +174,9 @@ export default async function userRoutes(app) {
     }
     return out
   })
-  app.get('/portfolio/summary', trader, (req) => summary(req.user.id))
-  app.get('/portfolio/history', trader, (req) => history(req.user.id, req.query.range || '1M'))
+  // mode: 'live' (gerçek) | 'paper' (sanal) – verilmezse canlı hesap varsa gerçek, yoksa sanal
+  app.get('/portfolio/summary', trader, (req) => summary(req.user.id, req.query.mode))
+  app.get('/portfolio/history', trader, (req) => history(req.user.id, req.query.range || '1M', req.query.mode))
 
   // ================================================================ kurallar
   app.get('/rules', trader, (req) => rules.listRules(req.user.id))

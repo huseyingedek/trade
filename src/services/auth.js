@@ -81,7 +81,7 @@ export async function register({ name, email, password }, meta) {
       risk: { create: {} },
     },
   })
-  const token = signPurpose('verify', user.id, {}, '3d')
+  const token = signPurpose('verify', user.id, { em: user.email }, '3d')
   await sendMail({ to: user.email, subject: 'Tradepilo – e-posta doğrulama', text: `Hesabınızı doğrulamak için: ${config.APP_URL}/verify-email?token=${token}` })
   if (config.REQUIRE_EMAIL_VERIFICATION) return { requiresVerification: true }
   return createSession(user, meta)
@@ -124,16 +124,23 @@ export async function login({ email, password }, meta) {
   return { requires2fa: true, challengeId: ch.id, method: 'totp' }
 }
 
+const MAX_2FA_ATTEMPTS = 5
+
 export async function verify2fa({ challengeId, code }, meta) {
-  const ch = await prisma.loginChallenge.findUnique({ where: { id: String(challengeId || '') }, include: { user: true } })
+  const id = String(challengeId || '')
+  const ch = await prisma.loginChallenge.findUnique({ where: { id }, include: { user: true } })
   if (!ch || ch.usedAt || ch.expiresAt < new Date()) throw unauthorized('Doğrulama süresi doldu, tekrar giriş yapın', 'CHALLENGE_EXPIRED')
-  if (ch.attempts >= 5) throw unauthorized('Çok fazla hatalı deneme, tekrar giriş yapın', 'CHALLENGE_LOCKED')
+  // Deneme hakkı ATOMİK olarak düşülür: aynı anda gönderilen paralel istekler 5 deneme sınırını aşamaz
+  const claim = await prisma.loginChallenge.updateMany({
+    where: { id, usedAt: null, attempts: { lt: MAX_2FA_ATTEMPTS }, expiresAt: { gt: new Date() } },
+    data: { attempts: { increment: 1 } },
+  })
+  if (!claim.count) throw unauthorized('Çok fazla hatalı deneme, tekrar giriş yapın', 'CHALLENGE_LOCKED')
   const secret = ch.purpose === 'setup' ? decrypt(ch.pendingSecretEnc) : decrypt(ch.user.twoFactorSecretEnc)
-  if (!verifyCode(secret, code)) {
-    await prisma.loginChallenge.update({ where: { id: ch.id }, data: { attempts: { increment: 1 } } })
-    throw unauthorized('Doğrulama kodu hatalı', 'INVALID_2FA')
-  }
-  await prisma.loginChallenge.update({ where: { id: ch.id }, data: { usedAt: new Date() } })
+  if (!verifyCode(secret, code)) throw unauthorized('Doğrulama kodu hatalı', 'INVALID_2FA')
+  // Tek kullanımlık: aynı doğrulama ile iki oturum açılamaz
+  const used = await prisma.loginChallenge.updateMany({ where: { id, usedAt: null }, data: { usedAt: new Date() } })
+  if (!used.count) throw unauthorized('Doğrulama süresi doldu, tekrar giriş yapın', 'CHALLENGE_EXPIRED')
   if (ch.purpose === 'setup') await prisma.user.update({ where: { id: ch.userId }, data: { twoFactorEnabled: true, twoFactorSecretEnc: encrypt(secret) } })
   return createSession(ch.user, meta)
 }
@@ -151,12 +158,15 @@ export async function start2faSetup(userId) {
 export async function enable2fa(userId, { challengeId, code }) {
   const ch = await prisma.loginChallenge.findFirst({ where: { id: String(challengeId || ''), userId, purpose: 'setup', usedAt: null } })
   if (!ch || ch.expiresAt < new Date()) throw badRequest('Kurulum süresi doldu, yeniden başlatın')
+  const claim = await prisma.loginChallenge.updateMany({ where: { id: ch.id, usedAt: null, attempts: { lt: MAX_2FA_ATTEMPTS } }, data: { attempts: { increment: 1 } } })
+  if (!claim.count) throw badRequest('Çok fazla hatalı deneme, kurulumu yeniden başlatın', 'CHALLENGE_LOCKED')
   const secret = decrypt(ch.pendingSecretEnc)
   if (!verifyCode(secret, code)) throw badRequest('Doğrulama kodu hatalı', 'INVALID_2FA')
-  await prisma.$transaction([
-    prisma.loginChallenge.update({ where: { id: ch.id }, data: { usedAt: new Date() } }),
-    prisma.user.update({ where: { id: userId }, data: { twoFactorEnabled: true, twoFactorSecretEnc: encrypt(secret) } }),
-  ])
+  await prisma.$transaction(async (tx) => {
+    const used = await tx.loginChallenge.updateMany({ where: { id: ch.id, usedAt: null }, data: { usedAt: new Date() } })
+    if (!used.count) throw badRequest('Kurulum süresi doldu, yeniden başlatın')
+    await tx.user.update({ where: { id: userId }, data: { twoFactorEnabled: true, twoFactorSecretEnc: encrypt(secret) } })
+  })
   return meView(userId)
 }
 
@@ -171,8 +181,9 @@ export async function disable2fa(userId, { code }) {
 }
 
 // ------------------------------------------------------------------ profil
-export async function updateMe(userId, body) {
+export async function updateMe(userId, body, sessionId = null) {
   const data = {}
+  let emailChanged = false
   if (body.name !== undefined) {
     if (!body.name.trim() || body.name.trim().length < 2) throw badRequest('Ad en az 2 karakter olmalı')
     data.name = body.name.trim()
@@ -180,9 +191,20 @@ export async function updateMe(userId, body) {
   if (body.email !== undefined) {
     const e = String(body.email).trim().toLowerCase()
     if (!EMAIL_RE.test(e)) throw badRequest('Geçerli bir e-posta girin')
-    const other = await prisma.user.findUnique({ where: { email: e } })
-    if (other && other.id !== userId) throw conflict('Bu e-posta başka bir hesapta kullanılıyor', 'EMAIL_TAKEN')
-    data.email = e
+    const current = await prisma.user.findUnique({ where: { id: userId } })
+    if (e !== current.email) {
+      // E-posta, şifre sıfırlamanın gittiği adres: değiştirmek hesabı ele geçirmek demek.
+      // Bu yüzden mevcut şifre (ve 2FA açıksa kod) istenir; yeni adres yeniden doğrulanır.
+      if (!(await bcrypt.compare(String(body.currentPassword || ''), current.passwordHash)))
+        throw badRequest('E-posta değiştirmek için mevcut şifrenizi girin', 'PASSWORD_REQUIRED')
+      if (current.twoFactorEnabled && !verifyCode(decrypt(current.twoFactorSecretEnc), body.code))
+        throw badRequest('E-posta değiştirmek için doğrulama kodunu girin', 'INVALID_2FA')
+      const other = await prisma.user.findUnique({ where: { email: e } })
+      if (other) throw conflict('Bu e-posta başka bir hesapta kullanılıyor', 'EMAIL_TAKEN')
+      data.email = e
+      data.emailVerifiedAt = null
+      emailChanged = current.email
+    }
   }
   if (body.baseCurrency !== undefined) {
     if (!['USD', 'TRY', 'EUR'].includes(body.baseCurrency)) throw badRequest('Desteklenmeyen para birimi')
@@ -194,6 +216,14 @@ export async function updateMe(userId, body) {
     if (data.notifications.telegram && !data.notifications.telegramChatId) throw badRequest('Telegram için Chat ID gerekli')
   }
   await prisma.user.update({ where: { id: userId }, data })
+  if (emailChanged) {
+    const token = signPurpose('verify', userId, { em: data.email }, '3d')
+    await sendMail({ to: data.email, subject: 'Tradepilo – e-posta doğrulama', text: `Yeni e-posta adresinizi doğrulamak için: ${config.APP_URL}/verify-email?token=${token}` })
+    // eski adrese bilgi: hesap sahibi değişikliği yapmadıysa fark edebilsin
+    await sendMail({ to: emailChanged, subject: 'Tradepilo – e-posta adresiniz değiştirildi', text: `Hesabınızın e-posta adresi ${data.email} olarak değiştirildi. Bu değişikliği siz yapmadıysanız hemen destek ile iletişime geçin.` })
+    // diğer oturumlar kapatılır (bu oturum açık kalır)
+    await prisma.session.updateMany({ where: { userId, revokedAt: null, ...(sessionId ? { id: { not: sessionId } } : {}) }, data: { revokedAt: new Date() } })
+  }
   return meView(userId)
 }
 
@@ -271,6 +301,9 @@ export async function verifyEmail({ token }) {
   } catch {
     throw badRequest('Doğrulama bağlantısı geçersiz')
   }
+  // Bağlantı hangi adres için üretildiyse sadece o adresi doğrular (e-posta sonradan değiştiyse eski bağlantı geçersiz)
+  const cur = await prisma.user.findUnique({ where: { id: p.sub }, select: { email: true } })
+  if (!cur || (p.em && p.em !== cur.email)) throw badRequest('Doğrulama bağlantısı geçersiz')
   const u = await prisma.user.update({ where: { id: p.sub }, data: { emailVerifiedAt: new Date() } })
   if (u.status === 'pending') await prisma.user.update({ where: { id: u.id }, data: { status: 'active' } })
   return { ok: true }

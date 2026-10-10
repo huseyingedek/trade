@@ -12,7 +12,7 @@ import { hub } from '../realtime/hub.js'
 import { logActivity } from '../services/activity.js'
 import { placeOrder } from '../trading/orders.js'
 import { getPlatform } from '../services/platform.js'
-import { ACCOUNT_CCY } from '../exchanges/providers.js'
+import { ACCOUNT_CCY, providerById } from '../exchanges/providers.js'
 import { log } from '../lib/logger.js'
 
 const STATUS_TR = { running: 'başlatıldı', paused: 'duraklatıldı', stopped: 'durduruldu' }
@@ -62,6 +62,12 @@ async function validate(userId, body) {
   if (conn.mode === 'paper') {
     const bal = await prisma.balance.findUnique({ where: { exchangeId_asset: { exchangeId: conn.id, asset: ACCOUNT_CCY[conn.market] } } })
     if (feed.convert(inv, ins.quote, ACCOUNT_CCY[conn.market]) > num(bal?.free ?? 0)) throw unprocessable('Bot için yetersiz bakiye', 'INSUFFICIENT_FUNDS')
+  } else {
+    // canlı: borsanın minimum emir tutarı ve borsadaki gerçek bakiye
+    const minCost = providerById[conn.provider]?.minOrderQuote
+    if (minCost && perOrder < minCost) throw badRequest(`Borsa emir başına en az ~${minCost} ${ins.quote} kabul ediyor; bu ayarla emir başına ${perOrder.toFixed(2)} ${ins.quote} düşüyor.${body.strategy === 'grid' ? ` Toplam tutarı en az ${Math.ceil(minCost * config.grids)} ${ins.quote} yapın veya kademe sayısını azaltın.` : ''}`, 'MIN_NOTIONAL')
+    const bal = await prisma.balance.findUnique({ where: { exchangeId_asset: { exchangeId: conn.id, asset: ins.quote } } })
+    if (inv > num(bal?.free ?? 0) * 1.0001) throw unprocessable(`Bot için yetersiz bakiye: borsa hesabınızda ${num(bal?.free ?? 0).toFixed(2)} ${ins.quote} var`, 'INSUFFICIENT_FUNDS')
   }
   return { name: body.name.trim(), strategy: body.strategy, exchangeId: conn.id, symbol: ins.symbol, investment: inv, config }
 }

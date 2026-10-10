@@ -151,7 +151,7 @@ export async function userAction(req, id, action, body = {}) {
     await revokeAllSessions(id)
     await audit(req, 'user.reset_2fa', u.name, body.reason.trim(), id)
   } else if (action === 'resend-verification') {
-    const token = signPurpose('verify', u.id, {}, '3d')
+    const token = signPurpose('verify', u.id, { em: u.email }, '3d')
     await sendMail({ to: u.email, subject: 'Tradepilo – e-posta doğrulama', text: `${config.APP_URL}/verify-email?token=${token}` })
     await audit(req, 'user.verify_email', u.name, 'Doğrulama e-postası yeniden gönderildi', id)
   } else if (action === 'note') {

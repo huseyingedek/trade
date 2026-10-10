@@ -24,6 +24,18 @@ const schema = z.object({
     .string()
     .refine((v) => Buffer.from(v, 'base64').length === 32, 'ENCRYPTION_KEY 32 byte base64 olmalı (npm run keygen)'),
 
+  /**
+   * Önündeki güvenilir proxy sayısı (Caddy/Nginx/Render = 1). İstemci IP'si X-Forwarded-For'dan
+   * sadece bu kadar adım geriye okunur; böylece istemci sahte başlıkla hız limitini atlatamaz.
+   * Proxy yoksa 0. Sayı yerine IP/CIDR listesi de verilebilir (örn. 127.0.0.1).
+   */
+  TRUST_PROXY: z.string().default('1'),
+  /**
+   * Emir motoru, botlar, kurallar, günlük zarar kontrolü bu süreçte çalışsın mı (varsayılan: evet).
+   * Canlı veritabanına bağlanan YEREL geliştirme sunucusunda "false" yapın; yoksa canlı sunucuyla
+   * birlikte iki motor aynı emirleri işler (canlı hesapta mükerrer emir riski).
+   */
+  ENGINE_ENABLED: z.enum(['true', 'false']).default('true').transform((v) => v === 'true'),
   CORS_ORIGIN: z.string().default('http://localhost:5173,http://localhost:4173'),
   APP_URL: z.string().default('http://localhost:5173'),
 

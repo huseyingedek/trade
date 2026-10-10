@@ -10,6 +10,8 @@ import { log } from '../lib/logger.js'
 import { feed } from '../market/feed.js'
 import { tickCandles, pushDepth, warmCandleChannels } from '../market/depth.js'
 import { processOrders, processProtection, pollLiveOrders } from '../trading/engine.js'
+import { syncLiveBalances } from '../trading/orders.js'
+import { syncCryptoCatalog } from '../market/catalog.js'
 import { checkDailyLoss } from '../trading/risk.js'
 import { processRules } from '../automation/rules.js'
 import { processBots } from '../automation/bots.js'
@@ -47,9 +49,11 @@ async function pushPortfolio() {
 async function snapshots() {
   const users = await prisma.user.findMany({ where: { role: 'user', exchanges: { some: {} } }, select: { id: true } })
   for (const u of users) {
-    const v = await totalValueUsd(u.id)
-    await prisma.portfolioSnapshot.create({ data: { userId: u.id, valueUsd: v } })
-    await ensureDayStart(u.id, v) // gün dönümünde gün başı değerini yakala
+    // gerçek ve sanal ayrı kaydedilir (grafikler ve günlük K/Z karışmaz)
+    const [live, paper] = await Promise.all([totalValueUsd(u.id, 'live'), totalValueUsd(u.id, 'paper')])
+    await prisma.portfolioSnapshot.create({ data: { userId: u.id, valueUsd: live + paper, liveUsd: live, paperUsd: paper } })
+    await ensureDayStart(u.id, live, 'live') // gün dönümünde gün başı değerlerini yakala
+    await ensureDayStart(u.id, paper, 'paper')
   }
   // 400 günden eski görüntüleri temizle
   await prisma.portfolioSnapshot.deleteMany({ where: { ts: { lt: new Date(Date.now() - 400 * DAY) } } })
@@ -77,11 +81,15 @@ async function cleanup() {
 }
 
 export function startJobs() {
+  // ENGINE_ENABLED=false: bu süreç emir/bot/kural/risk işlerini YAPMAZ (yalnızca API + canlı ekran verisi).
+  // Aynı veritabanına bağlı ikinci bir sunucu (ör. canlı DB'ye bağlanan yerel geliştirme) emirleri
+  // ikinci kez işlemesin, canlı borsaya mükerrer emir göndermesin diye.
+  const engine = config.ENGINE_ENABLED
   // Her fiyat güncellemesinde koşullu emirler ve SL/TP
   let tickBusy = false
   feed.on('tick', async () => {
     tickCandles()
-    if (tickBusy) return
+    if (!engine || tickBusy) return
     tickBusy = true
     try {
       await processOrders()
@@ -94,15 +102,33 @@ export function startJobs() {
   })
   every(2000, 'depth', pushDepth)
   hub.on('subscriptions', warmCandleChannels)
+  every(5000, 'portfolio', pushPortfolio)
+  every(60_000, 'health', () => health.ping())
+  if (!engine) {
+    log.warn('⚠️  ENGINE_ENABLED=false → emir motoru, botlar, kurallar ve risk kontrolleri bu süreçte KAPALI')
+    setTimeout(() => health.ping().catch(() => {}), 3000)
+    return
+  }
   every(2000, 'rules', processRules)
   every(5000, 'bots', processBots)
   every(10_000, 'dailyLoss', checkDailyLoss)
-  every(5000, 'portfolio', pushPortfolio)
   every(5 * 60_000, 'snapshots', snapshots)
   every(10 * 60_000, 'userMetrics', userMetrics)
-  every(60_000, 'health', () => health.ping())
+  // Binance'teki tüm USDT pariteleri: açılıştan kısa süre sonra ve günde bir
+  if (config.MARKET_DATA === 'auto') {
+    const runCatalog = () => syncCryptoCatalog().catch((e) => log.warn(`kripto kataloğu güncellenemedi: ${e.message?.slice(0, 120)}`))
+    setTimeout(runCatalog, 5000)
+    every(24 * 60 * 60_000, 'catalog', runCatalog)
+  }
   every(60 * 60_000, 'cleanup', cleanup)
-  if (config.LIVE_TRADING_ENABLED) every(5000, 'liveOrders', pollLiveOrders)
+  if (config.LIVE_TRADING_ENABLED) {
+    every(5000, 'liveOrders', pollLiveOrders)
+    // canlı hesap bakiyeleri (borsaya dışarıdan yatırılan / çekilen para) – 2 dakikada bir
+    every(2 * 60_000, 'liveBalances', async () => {
+      const list = await prisma.exchangeAccount.findMany({ where: { mode: 'live', status: 'connected' } })
+      for (const c of list) await syncLiveBalances(c).catch((e) => log.warn({ err: e.message, exchange: c.id }, 'canlı bakiye senkronlanamadı'))
+    })
+  }
 
   // açılışta bir kez
   setTimeout(() => {

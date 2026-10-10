@@ -3,8 +3,9 @@
 //  • Kripto: ccxt üzerinden gerçek fiyatlar (varsayılan Binance public API)
 //  • Forex: ECB referans kurları (frankfurter.app) etrafında simülasyon
 //  • BIST: ücretsiz gerçek zamanlı kaynak olmadığı için simülasyon
-//  Kaynak ulaşılamazsa son gerçek fiyattan simülasyona otomatik geçilir.
-//  Her ticker'da `source: 'live' | 'sim'` alanı bulunur.
+//  Kaynak geçici olarak ulaşılamazsa son gerçek fiyat korunur (source: 'stale');
+//  hiç gerçek veri alınamamışsa simülasyon kullanılır.
+//  Her ticker'da `source: 'live' | 'stale' | 'sim'` alanı bulunur.
 // =====================================================================
 import { EventEmitter } from 'node:events'
 import ccxt from 'ccxt'
@@ -41,6 +42,9 @@ class MarketFeed extends EventEmitter {
     this.ccxt = null
     this.ccxtOk = false
     this.running = false
+    this.srcIndex = new Map()
+    this.sentTs = new Map()
+    this.lastFull = 0
     this.setMaxListeners(50)
   }
 
@@ -69,6 +73,10 @@ class MarketFeed extends EventEmitter {
     const list = await prisma.instrument.findMany({ where: { active: true }, orderBy: [{ market: 'asc' }, { sortOrder: 'asc' }] })
     this.instruments = new Map(
       list.map((i) => [i.symbol, { ...i, tickSize: Number(i.tickSize), qtyStep: Number(i.qtyStep) }]),
+    )
+    // borsa sembolü (BTCUSDT) → platform sembolü (BTC/USDT)
+    this.srcIndex = new Map(
+      [...this.instruments.values()].filter((i) => i.dataSource !== 'sim').map((i) => [String(i.sourceSymbol || i.symbol).replace('/', '').toUpperCase(), i.symbol]),
     )
     for (const i of this.instruments.values()) {
       if (this.state.has(i.symbol)) continue
@@ -130,22 +138,15 @@ class MarketFeed extends EventEmitter {
   }
 
   /**
-   * Binance WebSocket ticker akışı (<sembol>@ticker, saniyede 1 güncelleme).
-   * REST "request weight" limitine takılmaz. Bağlantı koparsa artan bekleme ile yeniden bağlanır;
-   * Binance bağlantıları 24 saatte bir kapattığı için bu normaldir. Enstrüman listesi değişirse yeniden abone olur.
+   * Binance WebSocket – TÜM spot sembollerin özet akışı (!miniTicker@arr, saniyede 1).
+   * Tek bağlantı; sembol sayısından bağımsız, REST istek limitine takılmaz.
+   * Bağlantı koparsa artan bekleme ile yeniden bağlanır (Binance 24 saatte bir kapatır – normal).
    */
   async binanceStreamLoop() {
     const HOSTS = ['wss://data-stream.binance.vision', 'wss://stream.binance.com:9443']
     let attempt = 0
     while (this.running) {
-      const live = [...this.instruments.values()].filter((i) => this.usesExternal(i))
-      if (!live.length) {
-        await sleep(5000)
-        continue
-      }
-      const map = new Map(live.map((i) => [String(i.sourceSymbol || i.symbol).replace('/', '').toUpperCase(), i.symbol]))
-      const key = [...map.keys()].sort().join(',')
-      const url = `${HOSTS[attempt % HOSTS.length]}/stream?streams=${[...map.keys()].map((k) => `${k.toLowerCase()}@ticker`).join('/')}`
+      const url = `${HOSTS[attempt % HOSTS.length]}/stream?streams=!miniTicker@arr`
       const startedAt = Date.now()
       let gotData = false
       await new Promise((resolve) => {
@@ -155,11 +156,10 @@ class MarketFeed extends EventEmitter {
           try { ws?.close() } catch { /* zaten kapalı */ }
           resolve()
         }
-        // veri gelmiyorsa / liste değiştiyse / durdurulduysa bağlantıyı yenile
+        // veri gelmiyorsa / durdurulduysa bağlantıyı yenile
         const watch = setInterval(() => {
-          const nowKey = [...this.instruments.values()].filter((i) => this.usesExternal(i)).map((i) => String(i.sourceSymbol || i.symbol).replace('/', '').toUpperCase()).sort().join(',')
           const silent = Date.now() - (this.lastStreamAt || startedAt) > 30_000
-          if (!this.running || nowKey !== key || silent) done()
+          if (!this.running || silent) done()
         }, 5000)
         try {
           ws = new WebSocket(url)
@@ -170,25 +170,31 @@ class MarketFeed extends EventEmitter {
         ws.onmessage = (ev) => {
           let msg
           try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString()) } catch { return }
-          const t = msg?.data
-          if (!t || t.e !== '24hrTicker') return
-          const symbol = map.get(t.s)
-          const st = symbol && this.state.get(symbol)
-          if (!st) return
-          const last = +t.c
-          if (!(last > 0)) return
-          Object.assign(st, {
-            last, open: +t.o || st.open, high: +t.h || Math.max(st.high, last), low: +t.l || Math.min(st.low, last),
-            volume: +t.q || st.volume, bid: +t.b || last, ask: +t.a || last,
-            ts: Date.now(), source: 'live', liveAt: Date.now(),
-          })
-          this.lastStreamAt = Date.now()
-          if (!gotData) {
+          const arr = Array.isArray(msg?.data) ? msg.data : Array.isArray(msg) ? msg : null
+          if (!arr) return
+          const now = Date.now()
+          let n = 0
+          for (const t of arr) {
+            const symbol = this.srcIndex.get(t.s)
+            const st = symbol && this.state.get(symbol)
+            if (!st) continue
+            const last = +t.c
+            if (!(last > 0)) continue
+            const half = Math.max(this.instruments.get(symbol)?.tickSize || 0, last * 0.00005)
+            Object.assign(st, {
+              last, open: +t.o || st.open, high: +t.h || Math.max(st.high, last), low: +t.l || Math.min(st.low, last),
+              volume: +t.q || st.volume, bid: last - half, ask: last + half,
+              ts: now, source: 'live', liveAt: now,
+            })
+            n++
+          }
+          this.lastStreamAt = now
+          if (!gotData && n) {
             gotData = true
             attempt = 0
-            if (!this.ccxtOk) log.info(`✅ Gerçek kripto fiyatları alınıyor (binance WebSocket, ${map.size} sembol)`)
+            if (!this.ccxtOk) log.info(`✅ Gerçek kripto fiyatları alınıyor (binance WebSocket, ${this.srcIndex.size} sembol)`)
+            this.ccxtOk = true
           }
-          this.ccxtOk = true
         }
         ws.onerror = () => {}
         ws.onclose = () => done()
@@ -201,7 +207,7 @@ class MarketFeed extends EventEmitter {
         attempt++
         await sleep(Math.min(60_000, 2000 * 2 ** Math.min(attempt, 5)))
       } else {
-        await sleep(1000) // normal yeniden bağlanma (24 saat sınırı / liste değişti)
+        await sleep(1000) // normal yeniden bağlanma (24 saat sınırı)
       }
     }
   }
@@ -255,9 +261,20 @@ class MarketFeed extends EventEmitter {
     }
   }
 
+  /** Sadece değişen fiyatlar gönderilir (yüzlerce sembolde her saniye tüm liste gereksiz); 30 sn'de bir tam liste */
   publish() {
     this.emit('tick')
-    hub.broadcast('tickers', this.list())
+    const now = Date.now()
+    const full = now - this.lastFull > 30_000
+    const out = []
+    for (const [symbol, s] of this.state) {
+      if (!this.instruments.has(symbol)) continue
+      if (!full && this.sentTs.get(symbol) === s.ts) continue
+      this.sentTs.set(symbol, s.ts)
+      out.push(this.ticker(symbol))
+    }
+    if (full) this.lastFull = now
+    if (out.length) hub.broadcast('tickers', out)
   }
 
   // ------------------------------------------------------------- erişim

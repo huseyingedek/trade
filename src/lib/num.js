@@ -1,7 +1,7 @@
 export const decimalsOf = (step) => {
-  const s = String(step)
-  if (s.includes('e-')) return +s.split('e-')[1]
-  return s.includes('.') ? s.split('.')[1].length : 0
+  const [mant, exp] = String(step).toLowerCase().split('e')
+  const mantDec = mant.includes('.') ? mant.split('.')[1].length : 0
+  return Math.max(0, mantDec - (exp ? +exp : 0))
 }
 /** step katına yuvarla */
 export const roundTo = (v, step) => +(Math.round(v / step) * step).toFixed(decimalsOf(step))

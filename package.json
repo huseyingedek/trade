@@ -22,7 +22,7 @@
     "smoke": "node --env-file-if-exists=.env scripts/smoke.js",
     "postinstall": "prisma generate",
     "start:prod": "prisma migrate deploy && node prisma/seed.js && node src/server.js",
-    "test:algo": "node --test --test-concurrency=1 test/algorithms.test.js"
+    "test:algo": "node --test --test-concurrency=1 test/algorithms.test.js test/live.test.js"
   },
   "dependencies": {
     "@fastify/cors": "^11.3.0",

@@ -9,6 +9,7 @@ import { toApi } from '../lib/serialize.js'
 import { badRequest, conflict, forbidden, notFound, unavailable } from '../lib/errors.js'
 import { providerById, ACCOUNT_CCY } from '../exchanges/providers.js'
 import { callAdapter } from '../exchanges/index.js'
+import { assertPublicUrl } from '../exchanges/adapters/genericAdapter.js'
 import { getProviderSettings } from './platform.js'
 import { logActivity } from './activity.js'
 import { hub } from '../realtime/hub.js'
@@ -22,9 +23,12 @@ export const connToApi = (c) => {
   return toApi(rest)
 }
 
-function checkCreds(provider, creds = {}) {
+async function checkCreds(provider, creds = {}) {
   for (const f of provider.fields) if (!String(creds[f.key] || '').trim()) throw badRequest(`${f.label} gerekli`)
-  return Object.fromEntries(provider.fields.map((f) => [f.key, String(creds[f.key]).trim()]))
+  const out = Object.fromEntries(provider.fields.map((f) => [f.key, String(creds[f.key]).trim()]))
+  // özel entegrasyon adresi: iç ağa / yerel servislere istek attırılamaz (SSRF)
+  if (out.baseUrl !== undefined) await assertPublicUrl(out.baseUrl).catch((e) => { throw badRequest(e.message, 'INVALID_URL') })
+  return out
 }
 
 async function test(provider, creds, testnet) {
@@ -61,7 +65,7 @@ export async function createConnection(userId, { provider: providerId, label, cr
 
   // Paper modda anahtar isteğe bağlı: hiç girilmezse anahtarsız sanal hesap açılır
   const noKeys = mode !== 'live' && provider.fields.every((f) => !String(credentials?.[f.key] || '').trim())
-  const creds = noKeys ? {} : checkCreds(provider, credentials)
+  const creds = noKeys ? {} : await checkCreds(provider, credentials)
   const res = noKeys ? { ok: true, latencyMs: null, permissions: ['read', 'spot', ...(provider.features.futures ? ['futures'] : [])] } : await test(provider, creds, !!testnet)
   // Paper modda gerçek anahtar zorunlu değil; ama girildiyse ve borsaya ulaşılabiliyorsa doğrulanır
   if (!res.ok && (mode === 'live' || /geçersiz|yetkisiz|Unauthorized|AuthenticationError/i.test(res.message))) {
@@ -90,9 +94,12 @@ export async function createConnection(userId, { provider: providerId, label, cr
   if (c.mode === 'paper') {
     const acct = ACCOUNT_CCY[provider.market]
     await prisma.balance.create({ data: { exchangeId: c.id, asset: acct, free: feed.convert(usd, 'USD', acct) } })
-    await adjustDayStart(userId, usd)
+    await adjustDayStart(userId, usd, 'paper')
   } else {
     await syncLiveBalances(c).catch(() => {})
+    // yeni bağlanan gerçek hesabın bakiyesi "bugünkü kâr" sayılmasın
+    const h = await loadHoldings(userId, 'live')
+    await adjustDayStart(userId, valueOf({ balances: h.balances.filter((b) => b.exchangeId === c.id), positions: [] }), 'live')
   }
   await logActivity(userId, { level: 'success', source: 'system', notify: true, exchangeId: c.id, message: `${provider.name} hesabı bağlandı: ${c.label} (${c.mode === 'paper' ? 'paper / sanal' : 'canlı'})` })
   hub.toUser(userId, 'exchanges')
@@ -133,8 +140,12 @@ export async function updateConnection(userId, id, patch, source = 'manual') {
   }
   if (patch.credentials) {
     const provider = providerById[c.provider]
-    const creds = checkCreds(provider, patch.credentials)
+    const creds = await checkCreds(provider, patch.credentials)
     const res = await test(provider, creds, c.testnet)
+    // Hesap açarken olduğu gibi: anahtar borsa tarafından reddedildiyse (veya canlı hesapta hiç doğrulanamadıysa)
+    // KAYDEDİLMEZ, eski anahtarlar korunur. Sanal hesapta yalnızca borsaya ulaşılamama (ağ/bölge) durumunda uyarıyla kaydedilir.
+    const authFail = !res.ok && /geçersiz|yetkisiz|Unauthorized|AuthenticationError/i.test(res.message)
+    if (!res.ok && (c.mode === 'live' || authFail)) throw badRequest(`Anahtarlar kaydedilmedi – bağlantı testi başarısız: ${res.message}`, 'AUTH_FAILED')
     data.credentialsEnc = encrypt(creds)
     data.apiKeyMasked = maskKey(creds.apiKey || creds.accountId || creds.customerNo)
     Object.assign(data, res.ok ? { status: 'connected', errorMessage: null, latencyMs: res.latencyMs, permissions: res.permissions, lastSyncAt: new Date() } : { status: c.mode === 'live' ? 'error' : 'connected', errorMessage: res.message })
@@ -155,10 +166,16 @@ export async function deleteConnection(userId, id) {
   const c = await own(userId, id)
   if (await prisma.position.count({ where: { exchangeId: id } })) throw conflict('Bu hesapta açık pozisyonlar var. Önce pozisyonları kapatın.')
   if (await prisma.bot.count({ where: { exchangeId: id, status: 'running' } })) throw conflict('Bu hesapta çalışan botlar var. Önce botları durdurun.')
+  // Canlı hesapta borsaya iletilmiş emirler bağlantı silinince takipsiz kalır → önce iptal edilmeli
+  if (c.mode === 'live') {
+    const openOrders = await prisma.order.count({ where: { exchangeId: id, status: 'open' } })
+    if (openOrders) throw conflict(`Bu hesapta ${openOrders} açık emir var. Bağlantıyı kaldırmadan önce emirleri iptal edin.`)
+  }
   const h = await loadHoldings(userId)
-  const removedUsd = valueOf({ balances: h.balances.filter((b) => b.exchangeId === id), positions: [] })
+  // silinen hesabın nakit + (sanal hesapta) açık pozisyon değeri: hesapla birlikte silinir, "zarar" sayılmamalı
+  const removedUsd = valueOf({ balances: h.balances.filter((b) => b.exchangeId === id), positions: h.positions.filter((p) => p.exchangeId === id) })
   await prisma.exchangeAccount.delete({ where: { id } })
-  await adjustDayStart(userId, -removedUsd)
+  await adjustDayStart(userId, -removedUsd, c.mode === 'live' ? 'live' : 'paper')
   await logActivity(userId, { level: 'warning', message: `${c.label} bağlantısı kaldırıldı` })
   ;['exchanges', 'orders', 'balances', 'bots'].forEach((ch) => hub.toUser(userId, ch))
   return { ok: true }

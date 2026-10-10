@@ -1,3 +1,4 @@
+import ccxt from 'ccxt'
 import { providerById } from './providers.js'
 import { ccxtAdapter, humanizeCcxtError } from './adapters/ccxtAdapter.js'
 import { oandaAdapter } from './adapters/oandaAdapter.js'
@@ -8,6 +9,23 @@ export function adapterFor(provider) {
   if (provider.ccxtId) return ccxtAdapter
   if (provider.id === 'oanda') return oandaAdapter
   return genericAdapter
+}
+
+const causeOf = (e) => e?.cause ?? e
+
+/** Borsada böyle bir emir yok */
+export const isOrderNotFound = (e) => causeOf(e) instanceof ccxt.OrderNotFound
+
+/**
+ * Emir gönderiminde hata: borsa emri alıp almadığı BİLİNMİYOR mu?
+ * Zaman aşımı / bağlantı kopması → belirsiz (emir borsada gerçekleşmiş olabilir).
+ * Borsanın açıkça reddettiği durumlar (geçersiz emir, bakiye, yetki, istek limiti) → kesin.
+ */
+export function isUncertainError(e) {
+  const c = causeOf(e)
+  if (c instanceof ccxt.DDoSProtection || c instanceof ccxt.InvalidNonce || c instanceof ccxt.OnMaintenance) return false
+  if (c instanceof ccxt.NetworkError) return true
+  return !(c instanceof ccxt.BaseError)
 }
 
 /** Adaptör çağrısı + sağlık metrikleri (gecikme / hata oranı) */

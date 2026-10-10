@@ -14,11 +14,12 @@ import { roundTo } from '../lib/num.js'
 import { num, toApi } from '../lib/serialize.js'
 import { badRequest, conflict, forbidden, locked, notFound, unavailable, unprocessable } from '../lib/errors.js'
 import { providerById, ACCOUNT_CCY } from '../exchanges/providers.js'
-import { callAdapter } from '../exchanges/index.js'
+import { callAdapter, isOrderNotFound, isUncertainError } from '../exchanges/index.js'
 import { decrypt } from '../lib/crypto.js'
 import { getPlatform, getProviderSettings } from '../services/platform.js'
 import { logActivity } from '../services/activity.js'
 import { totalValueUsd } from './portfolio.js'
+import { feeRate, liquidityOf, normalizeLiveFees } from './fees.js'
 import { log } from '../lib/logger.js'
 
 export const TYPE_TR = { market: 'piyasa', limit: 'limit', stop_market: 'stop-piyasa', stop_limit: 'stop-limit', trailing_stop: 'iz süren stop', oco: 'OCO' }
@@ -77,15 +78,23 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
   if (conn.mode === 'live' && !config.LIVE_TRADING_ENABLED) throw forbidden('Canlı işlem sunucuda kapalı (LIVE_TRADING_ENABLED=false)', 'LIVE_DISABLED')
 
   const qty = roundTo(+body.qty, ins.qtyStep)
-  if (!(qty > 0)) throw badRequest(`Miktar en az ${ins.qtyStep} olmalı`)
-  const n = (v) => (v === null || v === undefined || v === '' ? null : +v)
-  const price = n(body.price)
-  const stopPrice = n(body.stopPrice)
-  const trailingPct = n(body.trailingPct)
+  if (!(qty > 0) || !Number.isFinite(qty)) throw badRequest(`Miktar en az ${ins.qtyStep} olmalı`)
+  // sayısal alanlar: boş → null; sayı değilse / sonsuzsa / negatifse 400 (aksi halde veritabanı hatası 500 olur)
+  const n = (v, label) => {
+    if (v === null || v === undefined || v === '') return null
+    const x = +v
+    if (!Number.isFinite(x) || x < 0) throw badRequest(`${label} geçerli bir pozitif sayı olmalı`)
+    return x
+  }
+  const price = n(body.price, 'Fiyat')
+  const stopPrice = n(body.stopPrice, 'Stop fiyatı')
+  const trailingPct = n(body.trailingPct, 'İz mesafesi')
+  const takeProfit = n(body.takeProfit, 'Kâr-al')
+  const stopLoss = n(body.stopLoss, 'Zarar-kes')
 
   // kaldıraç: sağlayıcı + hesap izni + plan
   const futuresOk = prov.features.futures && conn.permissions.includes('futures') && user.plan.futures
-  let leverage = Math.round(n(body.leverage) || 1)
+  let leverage = Math.round(n(body.leverage, 'Kaldıraç') || 1)
   if (leverage > 1 && !futuresOk) throw forbidden(user.plan.futures ? 'Bu hesapta vadeli/kaldıraç izni yok' : `${user.plan.name} planında vadeli/kaldıraçlı işlem yok`, 'PLAN_LIMIT')
   if (leverage > platform.maxLeverage) throw unprocessable(`Maksimum kaldıraç ${platform.maxLeverage}x`, 'LEVERAGE_LIMIT')
   leverage = Math.max(1, leverage)
@@ -116,11 +125,21 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
       break
   }
 
-  const pos = await prisma.position.findUnique({ where: { exchangeId_symbol: { exchangeId, symbol } } })
   const refPrice = price || stopPrice || last
+
+  const pos = await prisma.position.findUnique({ where: { exchangeId_symbol: { exchangeId, symbol } } })
   const orderUsd = feed.toUsd(qty * refPrice, ins.quote)
   const reducing = !!pos && ((pos.side === 'long' && side === 'sell') || (pos.side === 'short' && side === 'buy'))
   const openingQty = reducing ? Math.max(0, roundTo(qty - num(pos.qty), ins.qtyStep)) : qty
+
+  // SL/TP, emirden SONRA kalacak pozisyonun yönüyle tutarlı olmalı (uzun: SL < fiyat < TP)
+  if (takeProfit !== null || stopLoss !== null) {
+    const long = reducing && openingQty <= 0 ? pos.side === 'long' : side === 'buy'
+    if (stopLoss !== null && !(stopLoss > 0 && (long ? stopLoss < refPrice : stopLoss > refPrice)))
+      throw badRequest(long ? 'Zarar-kes fiyatı emir fiyatının altında olmalı' : 'Zarar-kes fiyatı emir fiyatının üstünde olmalı')
+    if (takeProfit !== null && !(takeProfit > 0 && (long ? takeProfit > refPrice : takeProfit < refPrice)))
+      throw badRequest(long ? 'Kâr-al fiyatı emir fiyatının üstünde olmalı' : 'Kâr-al fiyatı emir fiyatının altında olmalı')
+  }
 
   // Canlı bağlantı yalnızca SPOT emir gönderir: kaldıraç ve açığa satış desteklenmez
   if (conn.mode === 'live') {
@@ -149,21 +168,29 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
         const acct = ACCOUNT_CCY[conn.market]
         const cash = await prisma.balance.findUnique({ where: { exchangeId_asset: { exchangeId, asset: acct } } })
         const lockedAmt = await lockedCash(conn)
-        if (feed.convert(marginQuote * (1 + config.TRADING_FEE_RATE), ins.quote, acct) > num(cash?.free ?? 0) - lockedAmt + 1e-9)
+        // teminat + komisyon (komisyon kaldıraçlı işlemde de tüm tutar üzerinden alınır)
+        const needQuote = marginQuote + openingQty * refPrice * feeRate(conn.provider, 'taker')
+        if (feed.convert(needQuote, ins.quote, acct) > num(cash?.free ?? 0) - lockedAmt + 1e-9)
           throw unprocessable('Yetersiz bakiye', 'INSUFFICIENT_FUNDS')
       } else {
         // Canlı (spot) hesap: borsadan senkronlanan serbest bakiye (borsadaki açık emirler zaten düşülmüş)
-        const need = openingQty * refPrice * (1 + config.TRADING_FEE_RATE)
-        const minCost = LIVE_MIN_ORDER_QUOTE[conn.provider]
+        const need = openingQty * refPrice * (1 + feeRate(conn.provider, 'taker'))
+        const minCost = prov.minOrderQuote
         if (minCost && openingQty * refPrice < minCost)
           throw badRequest(`Borsanın minimum emir tutarı yaklaşık ${minCost} ${ins.quote}. Bu emir ${roundTo(openingQty * refPrice, 0.01)} ${ins.quote}.`, 'MIN_NOTIONAL')
-        const bal = await prisma.balance.findUnique({ where: { exchangeId_asset: { exchangeId, asset: ins.quote } } })
-        const free = num(bal?.free ?? 0)
+        const readFree = async () => num((await prisma.balance.findUnique({ where: { exchangeId_asset: { exchangeId, asset: ins.quote } } }))?.free ?? 0)
+        let free = await readFree()
+        // kayıtlı bakiye eski olabilir (kullanıcı borsaya yeni para yatırmış olabilir) → borsadan tazele
+        if (need > free + 1e-9) {
+          await syncLiveBalances(conn).catch(() => {})
+          free = await readFree()
+        }
         if (need > free + 1e-9)
           throw unprocessable(`Yetersiz bakiye: borsa hesabınızda ${roundTo(free, 0.01)} ${ins.quote} var, bu emir için yaklaşık ${roundTo(need, 0.01)} ${ins.quote} gerekiyor`, 'INSUFFICIENT_FUNDS')
       }
       // 2) sonra pozisyon büyüklüğü limiti (bu emirden sonra pozisyonun toplam teminatı)
-      const total = await totalValueUsd(userId)
+      // limit, emrin verildiği hesabın türüne göre: gerçek para emri sadece gerçek varlığa, sanal emir sanala oranlanır
+      const total = await totalValueUsd(userId, conn.mode === 'live' ? 'live' : 'paper')
       const existingMargin = pos && !reducing ? num(pos.margin) : 0
       if (feed.toUsd(marginQuote + existingMargin, ins.quote) > (total * risk.maxPositionPct) / 100)
         throw unprocessable(`Risk limiti: bu pozisyon portföyünüzün %${risk.maxPositionPct} sınırını aşıyor`, 'RISK_LIMIT')
@@ -176,7 +203,7 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
   let order = await prisma.order.create({
     data: {
       userId, exchangeId, symbol, side, type, qty, price, stopPrice, trailingPct, leverage,
-      takeProfit: n(body.takeProfit), stopLoss: n(body.stopLoss),
+      takeProfit, stopLoss,
       source, ruleId, botId, refPrice: type === 'trailing_stop' ? last : null,
     },
     include: { exchange: true },
@@ -187,7 +214,7 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
   } else if (type === 'limit' && conn.mode === 'live') {
     order = await sendLiveLimit(order)
   } else if (type === 'limit' && (side === 'buy' ? last <= price : last >= price)) {
-    order = await execute(order, last, { silent: true })
+    order = await execute(order, last, { silent: true, liquidity: 'taker' })
   } else if (!silent) {
     await logActivity(userId, {
       source,
@@ -202,19 +229,41 @@ async function placeOrderUnlocked(userId, body, { source = 'manual', internal = 
 
 const stripRel = ({ exchange, ...o }) => (void exchange, o)
 
-/** Bekleyen alış emirlerinin kilitlediği nakit (paper) */
-/** Canlı spot emirlerde borsaların yaklaşık minimum emir tutarı (quote para birimi cinsinden) */
-const LIVE_MIN_ORDER_QUOTE = { binance: 5 }
-
+/**
+ * Bekleyen emirlerin kilitlediği nakit (paper).
+ * Pozisyon AÇAN kısım teminat kilitler: uzun pozisyonu kapatan satış (veya kısa pozisyonu kapatan alış)
+ * kilit gerektirmez, pozisyonu aşan kısım ise yeni (ters) pozisyon açacağı için teminat ayırır.
+ */
 export async function lockedCash(conn) {
-  const open = await prisma.order.findMany({ where: { exchangeId: conn.id, status: 'open', side: 'buy' } })
+  const [open, positions] = await Promise.all([
+    prisma.order.findMany({ where: { exchangeId: conn.id, status: 'open' } }),
+    prisma.position.findMany({ where: { exchangeId: conn.id } }),
+  ])
   const acct = ACCOUNT_CCY[conn.market]
+  const posBySym = new Map(positions.map((p) => [p.symbol, p]))
+  // sembol + yön bazında, pozisyonu kapatmaya ayrılabilecek miktar (sırayla tüketilir)
+  const closable = new Map()
   let sum = 0
   for (const o of open) {
     const ins = feed.instrument(o.symbol)
     if (!ins) continue
-    const px = num(o.price) || num(o.stopPrice) || feed.last(o.symbol)
-    sum += feed.convert((num(o.qty) * px) / (o.leverage || 1), ins.quote, acct)
+    let qty = num(o.qty)
+    const p = posBySym.get(o.symbol)
+    if (p && ((p.side === 'long' && o.side === 'sell') || (p.side === 'short' && o.side === 'buy'))) {
+      const k = `${o.symbol}:${o.side}`
+      const left = closable.has(k) ? closable.get(k) : num(p.qty)
+      const use = Math.min(left, qty)
+      closable.set(k, left - use)
+      qty -= use
+    }
+    if (!(qty > 0)) continue
+    let px
+    try {
+      px = num(o.price) || num(o.stopPrice) || feed.last(o.symbol)
+    } catch {
+      continue
+    }
+    sum += feed.convert((qty * px) / (o.leverage || 1), ins.quote, acct)
   }
   return sum
 }
@@ -227,31 +276,131 @@ export async function lockedCash(conn) {
  * Emri px fiyatından gerçekleştirir.
  * paper: tamamen platform defterinde. live: önce borsaya piyasa emri, sonra defter.
  */
-export async function execute(order, px, { silent = false } = {}) {
+export async function execute(order, px, { silent = false, liquidity } = {}) {
   const conn = order.exchange ?? (await prisma.exchangeAccount.findUnique({ where: { id: order.exchangeId } }))
-  if (conn.mode === 'live') {
+  if (conn.mode === 'live') return executeLive(order, conn, px, silent)
+  return applyFill(order, conn, px, silent, { liquidity: liquidity ?? liquidityOf(order) })
+}
+
+/** Borsaya gönderilen emrin platform kimliği (Kraken sınırı nedeniyle en fazla 18 karakter, harf+rakam) */
+export const clientIdFor = (order) => `tp${order.id.slice(-16)}`
+
+const reload = (order) => prisma.order.findUnique({ where: { id: order.id }, include: { exchange: true } })
+
+/**
+ * Borsaya emir gönderildi ama yanıt alınamadı (zaman aşımı, bağlantı kopması).
+ * Emir "reddedildi" İŞARETLENMEZ: borsada gerçekleşmiş olabilir. Açık kalır ve
+ * pollLiveOrders müşteri kimliğiyle (cid:…) borsadan durumunu doğrular.
+ */
+async function pendingReconcile(order, err, silent) {
+  log.warn({ err: err.message, order: order.id }, 'canlı emir: borsa yanıtı alınamadı, durum doğrulanacak')
+  await logActivity(order.userId, {
+    level: 'warning', source: 'system', exchangeId: order.exchangeId, symbol: order.symbol, notify: !silent,
+    message: `${order.symbol} ${SIDE_TR[order.side]} emri için borsadan yanıt alınamadı (${err.message}). Emrin durumu borsadan doğrulanıyor; tekrar emir vermeden önce bekleyin.`,
+  })
+  emitTrading(order.userId, 'orders')
+  return reload(order)
+}
+
+/** Canlı piyasa emri (doğrudan veya tetiklenen stop / OCO / iz süren emir) */
+async function executeLive(order, conn, px, silent) {
+  const ins = feed.instrument(order.symbol)
+  let creds, qty, closeAll
+  try {
+    creds = decrypt(conn.credentialsEnc)
+    ;({ qty, closeAll } = await liveSellQty(order, conn, creds, ins))
+  } catch (e) {
+    return reject(order, e.message, silent)
+  }
+  // Kimlik ÖNCE kaydedilir: yanıt gelmezse emir bu kimlikle borsada aranır
+  const cid = clientIdFor(order)
+  await prisma.order.update({ where: { id: order.id }, data: { externalId: `cid:${cid}` } })
+  let res
+  try {
+    res = await callAdapter(conn.provider, 'createOrder', creds, conn.testnet, { symbol: order.symbol, side: order.side, type: 'market', qty, price: px, clientOrderId: cid })
+  } catch (e) {
+    if (isUncertainError(e)) return pendingReconcile(order, e, silent)
+    await prisma.order.update({ where: { id: order.id }, data: { externalId: null } }).catch(() => {})
+    return reject(order, e.message, silent)
+  }
+  // Bundan sonraki hatalar emrin borsada VAR olduğunu değiştirmez → asla "reddedildi" denmez
+  await prisma.order.update({ where: { id: order.id }, data: { externalId: res.externalId ?? `cid:${cid}` } }).catch((e) => log.error({ err: e, order: order.id }, 'borsa emir kimliği kaydedilemedi'))
+  syncLiveBalances(conn).catch(() => {})
+  if (!(res.filled > 0)) {
+    if (['canceled', 'expired', 'rejected'].includes(res.status)) return reject(order, 'Borsada gerçekleşmedi (dolum yok)', silent)
+    // Bazı borsalar (Bybit, OKX) piyasa emrine sadece kimlik döndürür: dolum pollLiveOrders ile işlenir
+    emitTrading(order.userId, 'orders')
+    return reload(order)
+  }
+  px = res.average || px
+  let fees
+  try {
+    fees = res.fees?.length ? normalizeLiveFees(res.fees, { base: ins.base, quote: ins.quote, price: px }) : null
+  } catch {
+    fees = null
+  }
+  fees ??= { feeQuote: res.filled * px * feeRate(conn.provider, 'taker'), feeBase: 0 }
+  return applyFill(order, conn, px, silent, { qty: res.filled, ...fees, closeAll: closeAll && res.filled >= qty * 0.999 })
+}
+
+/**
+ * Canlı spot satış: borsadaki GERÇEK serbest bakiyeye göre miktar.
+ * Borsa alışta komisyonu alınan coinden keser; kullanıcı borsada elle de işlem yapmış olabilir.
+ * Pozisyonun tamamı satılıyorsa ve borsada biraz daha az coin varsa, olanın tamamı satılır
+ * ve defterdeki pozisyon tamamen kapatılır (geriye "toz" kalmaz).
+ */
+async function liveSellQty(order, conn, creds, ins) {
+  let qty = num(order.qty)
+  if (order.side !== 'sell') return { qty, closeAll: false }
+  const [free, pos] = await Promise.all([
+    callAdapter(conn.provider, 'freeBalance', creds, conn.testnet, ins.base),
+    prisma.position.findUnique({ where: { exchangeId_symbol: { exchangeId: conn.id, symbol: order.symbol } } }),
+  ])
+  const closeAll = !!pos && pos.side === 'long' && qty >= num(pos.qty) - 1e-12
+  if (!(free > 0)) throw new Error(`Borsa hesabınızda satılabilir ${ins.base} yok`)
+  if (free < qty) qty = free
+  return { qty, closeAll }
+}
+
+/** Canlı limit emri borsada (kısmen) doldu → defteri güncelle (borsaya yeniden emir göndermeden) */
+export async function applyLiveFill(order, r, note) {
+  const conn = order.exchange ?? (await prisma.exchangeAccount.findUnique({ where: { id: order.exchangeId } }))
+  const ins = feed.instrument(order.symbol)
+  let px = r.average || num(order.price)
+  if (!px) {
     try {
-      const creds = decrypt(conn.credentialsEnc)
-      const res = await callAdapter(conn.provider, 'createOrder', creds, conn.testnet, { symbol: order.symbol, side: order.side, type: 'market', qty: num(order.qty) })
-      px = res.average || px
-      await prisma.order.update({ where: { id: order.id }, data: { externalId: res.externalId } })
-      syncLiveBalances(conn).catch(() => {})
-    } catch (e) {
-      return reject(order, e.message, silent)
+      px = feed.last(order.symbol)
+    } catch {
+      px = 0
     }
   }
-  return applyFill(order, conn, px, silent)
+  const fees = r.fees?.length
+    ? normalizeLiveFees(r.fees, { base: ins.base, quote: ins.quote, price: px })
+    : { feeQuote: r.filled * px * feeRate(conn.provider, 'maker'), feeBase: 0 }
+  syncLiveBalances(conn).catch(() => {})
+  return applyFill(order, conn, px, false, { qty: r.filled, ...fees, note })
 }
 
 async function sendLiveLimit(order) {
   const conn = order.exchange
+  let creds, qty
   try {
-    const creds = decrypt(conn.credentialsEnc)
-    const res = await callAdapter(conn.provider, 'createOrder', creds, conn.testnet, { symbol: order.symbol, side: order.side, type: 'limit', qty: num(order.qty), price: num(order.price) })
-    return prisma.order.update({ where: { id: order.id }, data: { externalId: res.externalId }, include: { exchange: true } })
+    creds = decrypt(conn.credentialsEnc)
+    ;({ qty } = await liveSellQty(order, conn, creds, feed.instrument(order.symbol)))
   } catch (e) {
     return reject(order, e.message, false)
   }
+  const cid = clientIdFor(order)
+  await prisma.order.update({ where: { id: order.id }, data: { externalId: `cid:${cid}` } })
+  let res
+  try {
+    res = await callAdapter(conn.provider, 'createOrder', creds, conn.testnet, { symbol: order.symbol, side: order.side, type: 'limit', qty, price: num(order.price), clientOrderId: cid })
+  } catch (e) {
+    if (isUncertainError(e)) return pendingReconcile(order, e, false)
+    await prisma.order.update({ where: { id: order.id }, data: { externalId: null } }).catch(() => {})
+    return reject(order, e.message, false)
+  }
+  return prisma.order.update({ where: { id: order.id }, data: { externalId: res.externalId ?? `cid:${cid}` }, include: { exchange: true } })
 }
 
 export async function reject(order, reason, silent) {
@@ -262,7 +411,7 @@ export async function reject(order, reason, silent) {
 }
 
 /** Pozisyon / bakiye defterini güncelle (tek transaction) */
-async function applyFill(order, conn, px, silent) {
+async function applyFill(order, conn, px, silent, fill = {}) {
   const prov = providerById[conn.provider]
   const ins = feed.instrument(order.symbol)
   const acct = ACCOUNT_CCY[conn.market]
@@ -273,7 +422,10 @@ async function applyFill(order, conn, px, silent) {
 
   try {
     const result = await prisma.$transaction(async (tx) => {
-      let qtyLeft = num(order.qty)
+      const live = conn.mode === 'live'
+      // canlıda borsanın adımı/komisyon kesintisi bizim adımımızla uyuşmayabilir → yuvarlama yok
+      const rq = (x) => (live ? +(+x).toFixed(12) : roundTo(x, ins.qtyStep))
+      let qtyLeft = fill.qty != null ? +fill.qty : num(order.qty)
       let filledQty = qtyLeft
       let cashDeltaQuote = 0
       let realized = 0
@@ -282,15 +434,16 @@ async function applyFill(order, conn, px, silent) {
       // 1) ters yöndeki pozisyonu azalt / kapat
       if (pos && ((pos.side === 'long' && dir === -1) || (pos.side === 'short' && dir === 1))) {
         const pQty = num(pos.qty)
-        const closeQty = Math.min(pQty, qtyLeft)
+        // canlı satışta borsadaki bakiyenin tamamı satıldıysa defterdeki pozisyon da tamamen kapanır
+        const closeQty = fill.closeAll ? pQty : Math.min(pQty, qtyLeft)
         const posDir = pos.side === 'long' ? 1 : -1
         const released = (num(pos.margin) * closeQty) / pQty
         // Zarar yatırılan teminatı aşamaz (bakiye eksiye düşmez – tasfiye mantığı)
         const pnl = Math.max((px - num(pos.entryPrice)) * closeQty * posDir, -released)
         cashDeltaQuote += released + pnl
         realized += pnl
-        qtyLeft = roundTo(qtyLeft - closeQty, ins.qtyStep)
-        const remain = roundTo(pQty - closeQty, ins.qtyStep)
+        qtyLeft = fill.closeAll ? 0 : rq(qtyLeft - closeQty)
+        const remain = rq(pQty - closeQty)
         if (remain <= 0) {
           await tx.position.delete({ where: { id: pos.id } })
           pos = null
@@ -303,14 +456,16 @@ async function applyFill(order, conn, px, silent) {
       if (qtyLeft > 0) {
         if (dir === -1 && !canShort) {
           if (realized === 0 && cashDeltaQuote === 0) throw new Error('Satılacak yeterli pozisyon yok')
-          filledQty = roundTo(filledQty - qtyLeft, ins.qtyStep)
+          filledQty = rq(filledQty - qtyLeft)
           qtyLeft = 0
         } else {
           const lev = order.leverage || 1
+          // canlı alış: borsa komisyonu alınan coinden kestiyse pozisyon net miktarla açılır
+          if (live && fill.feeBase > 0 && dir === 1) qtyLeft = rq(Math.max(0, qtyLeft - fill.feeBase))
           const margin = (qtyLeft * px) / lev
           if (conn.mode === 'paper') {
             const cash = await tx.balance.findUnique({ where: { exchangeId_asset: { exchangeId: conn.id, asset: acct } } })
-            const estFee = num(order.qty) * px * config.TRADING_FEE_RATE
+            const estFee = filledQty * px * feeRate(conn.provider, fill.liquidity ?? 'taker')
             const available = num(cash?.free ?? 0) + feed.convert(cashDeltaQuote - estFee, ins.quote, acct)
             if (feed.convert(margin, ins.quote, acct) > available + 1e-9) throw new Error('Yetersiz bakiye')
           }
@@ -318,7 +473,7 @@ async function applyFill(order, conn, px, silent) {
             const pQty = num(pos.qty)
             pos = await tx.position.update({
               where: { id: pos.id },
-              data: { entryPrice: (num(pos.entryPrice) * pQty + px * qtyLeft) / (pQty + qtyLeft), qty: roundTo(pQty + qtyLeft, ins.qtyStep), margin: num(pos.margin) + margin },
+              data: { entryPrice: (num(pos.entryPrice) * pQty + px * qtyLeft) / (pQty + qtyLeft), qty: rq(pQty + qtyLeft), margin: num(pos.margin) + margin },
             })
           } else {
             pos = await tx.position.create({
@@ -328,8 +483,8 @@ async function applyFill(order, conn, px, silent) {
           cashDeltaQuote -= margin
         }
       }
-      // komisyon gerçekleşen miktar üzerinden
-      const fee = filledQty * px * config.TRADING_FEE_RATE
+      // komisyon: canlıda borsanın kestiği gerçek tutar, sanalda borsanın standart oranı (maker/taker)
+      const fee = fill.feeQuote != null ? fill.feeQuote : filledQty * px * feeRate(conn.provider, fill.liquidity ?? 'taker')
       cashDeltaQuote -= fee
 
       // 3) nakit (paper modda; canlıda borsadan senkronize edilir)
@@ -346,7 +501,7 @@ async function applyFill(order, conn, px, silent) {
       }
       const updated = await tx.order.update({
         where: { id: order.id },
-        data: { status: 'filled', qty: filledQty, filledQty, avgPrice: px, fee, realizedPnl: realized || null, filledAt: new Date() },
+        data: { status: 'filled', qty: filledQty, filledQty, avgPrice: px, fee, realizedPnl: realized || null, filledAt: new Date(), ...(fill.note ? { reason: fill.note } : {}) },
         include: { exchange: true },
       })
       return { updated, realized, fee }
@@ -364,6 +519,14 @@ async function applyFill(order, conn, px, silent) {
     emitTrading(order.userId, 'orders', 'positions', 'balances')
     return updated
   } catch (e) {
+    if (conn.mode === 'live') {
+      // Borsada GERÇEKLEŞMİŞ bir emir "reddedildi" olarak işaretlenmemeli
+      log.error({ err: e, order: order.id }, 'canlı dolum deftere işlenemedi')
+      const o = await prisma.order.update({ where: { id: order.id }, data: { status: 'filled', filledQty: fill.qty ?? order.qty, avgPrice: px, filledAt: new Date(), reason: 'Borsada gerçekleşti; platform defteri güncellenemedi – pozisyonu borsadan kontrol edin' }, include: { exchange: true } })
+      await logActivity(order.userId, { level: 'danger', source: 'system', exchangeId: order.exchangeId, symbol: order.symbol, notify: true, message: `${order.symbol} emri borsada gerçekleşti ancak platformdaki pozisyon güncellenemedi. Lütfen borsadaki bakiyenizi kontrol edin.` })
+      emitTrading(order.userId, 'orders', 'positions', 'balances')
+      return o
+    }
     if (e.message === 'Yetersiz bakiye' || e.message === 'Satılacak yeterli pozisyon yok') return reject(order, e.message, silent)
     log.error({ err: e }, 'fill hatası')
     return reject(order, 'Emir işlenirken hata oluştu', silent)
@@ -379,10 +542,18 @@ export function cancelOrder(userId, id, source = 'manual') {
     if (!o) throw notFound('Emir bulunamadı')
     if (o.status !== 'open') throw conflict('Sadece açık emirler iptal edilebilir')
     if (o.exchange.mode === 'live' && o.externalId) {
+      const creds = decrypt(o.exchange.credentialsEnc)
       try {
-        await callAdapter(o.exchange.provider, 'cancelOrder', decrypt(o.exchange.credentialsEnc), o.exchange.testnet, o.externalId, o.symbol)
+        await callAdapter(o.exchange.provider, 'cancelOrder', creds, o.exchange.testnet, o.externalId, o.symbol)
       } catch (e) {
-        throw unprocessable(`Borsada iptal edilemedi: ${e.message}`)
+        // yanıtı alınamamış ve borsada hiç oluşmamış emir → sadece platformda iptal edilir
+        if (!(o.externalId.startsWith('cid:') && isOrderNotFound(e))) throw unprocessable(`Borsada iptal edilemedi: ${e.message}`)
+      }
+      // iptalden önce kısmen dolduysa dolan kısım deftere işlenir
+      const r = await callAdapter(o.exchange.provider, 'fetchOrder', creds, o.exchange.testnet, o.externalId, o.symbol).catch(() => null)
+      if (r?.filled > 0) {
+        const f = await applyLiveFill(o, r, 'Kısmen gerçekleşti, kalanı iptal edildi')
+        return orderToApi(stripRel(f))
       }
     }
     const u = await prisma.order.update({ where: { id }, data: { status: 'canceled', canceledAt: new Date() } })
@@ -424,6 +595,7 @@ export async function updatePosition(userId, id, { stopLoss, takeProfit }) {
   const v = (x) => (x === '' || x === undefined || x === null ? null : +x)
   const sl = v(stopLoss)
   const tp = v(takeProfit)
+  if ((sl !== null && !(Number.isFinite(sl) && sl > 0)) || (tp !== null && !(Number.isFinite(tp) && tp > 0))) throw badRequest('Zarar-kes / kâr-al geçerli bir pozitif fiyat olmalı')
   const long = pos.side === 'long'
   if (sl !== null && (long ? sl >= last : sl <= last)) throw badRequest(long ? 'Zarar-kes fiyatı güncel fiyatın altında olmalı' : 'Zarar-kes fiyatı güncel fiyatın üstünde olmalı')
   if (tp !== null && (long ? tp <= last : tp >= last)) throw badRequest(long ? 'Kâr-al fiyatı güncel fiyatın üstünde olmalı' : 'Kâr-al fiyatı güncel fiyatın altında olmalı')

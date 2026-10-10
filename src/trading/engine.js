@@ -8,19 +8,51 @@ import { prisma } from '../lib/prisma.js'
 import { feed } from '../market/feed.js'
 import { withLock } from '../lib/mutex.js'
 import { num } from '../lib/serialize.js'
-import { execute, closePosition, emitTrading, reject } from './orders.js'
+import { execute, applyLiveFill, closePosition, emitTrading, reject } from './orders.js'
 import { logActivity } from '../services/activity.js'
-import { callAdapter } from '../exchanges/index.js'
+import { callAdapter, isOrderNotFound } from '../exchanges/index.js'
+import { getPlatform, getProviderSettings } from '../services/platform.js'
 import { decrypt } from '../lib/crypto.js'
 import { log } from '../lib/logger.js'
 
 let busy = false
 
+/** Durdurma nedeniyle bekletilen emirler (kullanıcıya bir kez bildirilir) */
+const haltNotified = new Set()
+
+/**
+ * Tetiklenen emir şu an gerçekleştirilebilir mi?
+ * Platform / kullanıcı / hesap / entegrasyon durdurmaları yeni emir girişi kadar bekleyen emirleri de kapsar.
+ * Sadece mevcut pozisyonu AZALTAN (koruyucu) emirler durdurma sırasında da çalışır.
+ * @returns {Promise<string|null>} engelleme nedeni
+ */
+export async function haltReason(o) {
+  const [platform, provSettings, user, risk] = await Promise.all([
+    getPlatform(),
+    getProviderSettings(),
+    prisma.user.findUnique({ where: { id: o.userId }, select: { status: true } }),
+    prisma.riskSettings.findUnique({ where: { userId: o.userId }, select: { killSwitchActive: true } }),
+  ])
+  let reason = null
+  if (platform.killSwitchActive) reason = 'platform genelinde işlemler durduruldu'
+  else if (platform.maintenanceActive) reason = 'platform bakımda'
+  else if (['trading_halted', 'suspended', 'disabled'].includes(user?.status)) reason = 'hesabınızda işlemler yönetici tarafından durduruldu'
+  else if (risk?.killSwitchActive) reason = 'acil durdurma aktif'
+  else if (o.exchange?.paused) reason = 'borsa hesabında işlemler duraklatıldı'
+  else if (provSettings[o.exchange?.provider]?.tradingHalted) reason = 'borsa entegrasyonu yönetici tarafından durduruldu'
+  else if (platform.blockedSymbols.includes(o.symbol)) reason = 'sembol platformda işleme kapalı'
+  if (!reason) return null
+  const pos = await prisma.position.findUnique({ where: { exchangeId_symbol: { exchangeId: o.exchangeId, symbol: o.symbol } } })
+  const reducing = !!pos && ((pos.side === 'long' && o.side === 'sell') || (pos.side === 'short' && o.side === 'buy')) && num(o.qty) <= num(pos.qty) + 1e-12
+  return reducing ? null : reason
+}
+
 export async function processOrders() {
   if (busy) return
   busy = true
   try {
-    const open = await prisma.order.findMany({ where: { status: 'open', NOT: { externalId: { not: null }, type: 'limit' } }, include: { exchange: true } })
+    // Borsaya gönderilmiş canlı emirler (externalId dolu) borsada takip edilir → pollLiveOrders
+    const open = await prisma.order.findMany({ where: { status: 'open', externalId: null }, include: { exchange: true } })
     for (const o of open) {
       let p
       try {
@@ -66,6 +98,18 @@ export async function processOrders() {
       await withLock(`u:${o.userId}`, async () => {
         const fresh = await prisma.order.findUnique({ where: { id: o.id }, include: { exchange: true } })
         if (fresh?.status !== 'open') return
+        // borsaya gönderilmiş canlı limit emri borsada dolar; burada tekrar piyasa emri GÖNDERİLMEZ
+        if (fresh.externalId && fresh.exchange.mode === 'live') return
+        const halt = await haltReason(fresh)
+        if (halt) {
+          // emir iptal edilmez, açık kalır; durdurma kalkınca koşul tekrar değerlendirilir
+          if (!haltNotified.has(fresh.id)) {
+            haltNotified.add(fresh.id)
+            await logActivity(fresh.userId, { level: 'warning', source: 'risk', exchangeId: fresh.exchangeId, symbol: fresh.symbol, notify: true, message: `${fresh.symbol} emri tetiklendi ancak gerçekleştirilmedi: ${halt}. Durdurma kalkınca emir yeniden değerlendirilecek.` })
+          }
+          return
+        }
+        haltNotified.delete(fresh.id)
         try {
           await execute(fresh, fillAt)
         } catch (e) {
@@ -153,20 +197,38 @@ export async function pollLiveOrders() {
   for (const o of list) {
     try {
       const r = await callAdapter(o.exchange.provider, 'fetchOrder', decrypt(o.exchange.credentialsEnc), o.exchange.testnet, o.externalId, o.symbol)
-      if (r.status === 'closed') {
+      // yanıtı alınamamış emir borsada bulundu → gerçek borsa kimliğini kaydet
+      if (o.externalId.startsWith('cid:') && r.externalId) {
+        await prisma.order.updateMany({ where: { id: o.id, status: 'open' }, data: { externalId: String(r.externalId) } })
+        o.externalId = String(r.externalId)
+      }
+      const ended = r.status === 'canceled' || r.status === 'expired' || r.status === 'rejected'
+      if (r.status === 'closed' || (ended && r.filled > 0)) {
         await withLock(`u:${o.userId}`, async () => {
           const fresh = await prisma.order.findUnique({ where: { id: o.id }, include: { exchange: true } })
           if (fresh?.status !== 'open') return
-          // borsa emri doldurdu → defteri güncelle (borsaya yeniden göndermeden)
+          // borsa emri (kısmen) doldurdu → defteri gerçek miktar/fiyat/komisyonla güncelle
           await prisma.exchangeAccount.update({ where: { id: o.exchangeId }, data: { lastSyncAt: new Date() } })
-          await execute({ ...fresh, exchange: { ...fresh.exchange, mode: 'paper-ledger' } }, r.average || num(fresh.price))
+          await applyLiveFill(fresh, r, ended ? 'Kısmen gerçekleşti, kalanı borsada iptal edildi' : undefined)
         })
-      } else if (r.status === 'canceled' || r.status === 'expired' || r.status === 'rejected') {
+      } else if (ended) {
         await prisma.order.update({ where: { id: o.id }, data: { status: 'canceled', canceledAt: new Date(), reason: 'Borsada iptal edildi' } })
         emitTrading(o.userId, 'orders')
       }
     } catch (e) {
+      // Yanıtı alınamamış emir borsada hiç yoksa (gönderim ulaşmamış) belirli bir süre sonra reddedilir
+      if (o.externalId.startsWith('cid:') && isOrderNotFound(e) && Date.now() - o.updatedAt.getTime() > CID_GRACE_MS) {
+        await withLock(`u:${o.userId}`, async () => {
+          const fresh = await prisma.order.findUnique({ where: { id: o.id }, include: { exchange: true } })
+          if (fresh?.status !== 'open' || fresh.externalId !== o.externalId) return
+          await reject(fresh, 'Emir borsaya ulaşmadı (borsada kaydı bulunamadı)', false)
+        })
+        continue
+      }
       log.warn({ err: e.message, order: o.id }, 'canlı emir durumu alınamadı')
     }
   }
 }
+
+/** Gönderilip yanıtı alınamayan emrin borsada görünmesi için beklenen süre */
+const CID_GRACE_MS = 90_000
