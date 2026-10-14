@@ -13,13 +13,16 @@ import { activeForUser } from '../services/admin.js'
 import { activityToApi, logActivity } from '../services/activity.js'
 import { PROVIDERS, providerView } from '../exchanges/providers.js'
 import { feed } from '../market/feed.js'
-import { INTERVALS, getCandles, getOrderBook, getTrades } from '../market/depth.js'
+import { INTERVALS, getCandles, getMarketStats, getOrderBook, getTrades } from '../market/depth.js'
 import { placeOrder, cancelOrder, cancelAll, closePosition, updatePosition, lockedCash, orderToApi } from '../trading/orders.js'
 import { positionMetrics, summary, history, assetToUsd } from '../trading/portfolio.js'
 import { riskState, updateRisk, setKillSwitch } from '../trading/risk.js'
 import { liquidationPrice } from '../trading/engine.js'
 import * as rules from '../automation/rules.js'
 import * as bots from '../automation/bots.js'
+import { backtest } from '../backtest/index.js'
+import * as analysis from '../analysis/index.js'
+import { marketStatus } from '../analysis/market.js'
 import { getProviderSettings } from '../services/platform.js'
 
 const meta = (req) => ({ ip: req.ip, ua: req.headers['user-agent'] || '' })
@@ -131,6 +134,7 @@ export default async function userRoutes(app) {
     if (!INTERVALS[interval]) throw badRequest('Geçersiz aralık')
     return getCandles(symbol, interval, Math.min(1000, Math.max(10, +limit || 300)))
   })
+  app.get('/markets/stats', auth$, async (req) => getMarketStats(String(req.query.symbol || '')))
   app.get('/markets/orderbook', auth$, async (req) => {
     if (!feed.instrument(req.query.symbol)) throw badRequest('Bilinmeyen sembol')
     return getOrderBook(req.query.symbol, Math.min(50, +req.query.depth || 14))
@@ -162,14 +166,26 @@ export default async function userRoutes(app) {
   app.post('/positions/:id/close', trader, (req) => closePosition(req.user.id, req.params.id, req.body?.percent ?? 100))
   app.patch('/positions/:id', trader, (req) => updatePosition(req.user.id, req.params.id, req.body || {}))
   app.get('/balances', trader, async (req) => {
-    const conns = await prisma.exchangeAccount.findMany({ where: { userId: req.user.id }, include: { balances: true } })
+    const conns = await prisma.exchangeAccount.findMany({ where: { userId: req.user.id }, include: { balances: true, walletHoldings: true } })
     const out = []
     for (const c of conns) {
-      const lockedAmt = c.mode === 'paper' ? await lockedCash(c) : 0
+      if (c.mode === 'live') {
+        // canlı: Spot serbest + emirlerde kilitli (aynı satır) · Fonlama / Earn ayrı satır (işlemde kullanılamaz)
+        const spot = new Map()
+        for (const b of c.balances) spot.set(b.asset, { free: num(b.free), locked: 0 })
+        for (const w of c.walletHoldings.filter((x) => x.wallet === 'spot_locked')) spot.set(w.asset, { free: spot.get(w.asset)?.free ?? 0, locked: num(w.amount) })
+        for (const [asset, v] of spot) out.push({ exchangeId: c.id, wallet: 'spot', asset, free: v.free, locked: v.locked, total: v.free + v.locked, available: v.free, valueUsd: assetToUsd(v.free + v.locked, asset) })
+        for (const w of c.walletHoldings.filter((x) => x.wallet !== 'spot_locked')) {
+          const amt = num(w.amount)
+          out.push({ exchangeId: c.id, wallet: w.wallet, asset: w.asset, free: 0, locked: 0, total: amt, available: 0, valueUsd: assetToUsd(amt, w.asset) })
+        }
+        continue
+      }
+      const lockedAmt = await lockedCash(c)
       for (const b of c.balances) {
         const free = num(b.free)
         const l = b.asset === (c.market === 'bist' ? 'TRY' : c.market === 'forex' ? 'USD' : 'USDT') ? lockedAmt : 0
-        out.push({ exchangeId: c.id, asset: b.asset, free, locked: l, total: free, available: Math.max(0, free - l), valueUsd: assetToUsd(free, b.asset) })
+        out.push({ exchangeId: c.id, wallet: 'spot', asset: b.asset, free, locked: l, total: free, available: Math.max(0, free - l), valueUsd: assetToUsd(free, b.asset) })
       }
     }
     return out
@@ -187,6 +203,15 @@ export default async function userRoutes(app) {
   // ================================================================ botlar
   app.get('/bots', trader, (req) => bots.listBots(req.user.id))
   app.get('/bots/:id', trader, (req) => bots.getBotDetail(req.user.id, req.params.id))
+  // Geçmiş veride bot testi (emir göndermez). Ağır olduğu için dakikada en fazla 15.
+  // Analiz merkezi (bilgi amaçlı teknik görünüm – herkese aynı, kişiye özel tavsiye değil)
+  app.get('/analysis/overview', auth$, () => analysis.overview())
+  app.get('/analysis/market', auth$, () => marketStatus({ analyzeBtc: () => analysis.analyze('BTC/USDT') }))
+  app.get('/analysis/symbol', { ...auth$, config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, (req) => analysis.analyze(String(req.query.symbol || '')))
+  app.get('/analysis/track-record', auth$, (req) =>
+    analysis.trackRecord({ horizon: req.query.horizon || 'short', days: Math.min(365, Math.max(7, +req.query.days || 180)), symbol: req.query.symbol || undefined }),
+  )
+  app.post('/backtest', { ...trader, config: { rateLimit: { max: 15, timeWindow: '1 minute' } } }, (req) => backtest(req.user.id, req.body || {}))
   app.post('/bots', trader, (req) => bots.createBot(req.user.id, req.body || {}))
   app.post('/bots/:id/start', trader, (req) => bots.setStatus(req.user.id, req.params.id, 'running'))
   app.post('/bots/:id/pause', trader, (req) => bots.setStatus(req.user.id, req.params.id, 'paused'))

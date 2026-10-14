@@ -606,13 +606,51 @@ export async function updatePosition(userId, id, { stopLoss, takeProfit }) {
 }
 
 /** Canlı hesap bakiyelerini borsadan çek */
-export async function syncLiveBalances(conn) {
+const SYNC_ERR = 'Bakiye alınamadı: '
+const walletsAt = new Map() // exchangeId → son ek cüzdan okuma zamanı
+const WALLETS_EVERY = 15 * 60_000
+
+/**
+ * Canlı hesabın bakiyelerini borsadan çek.
+ *  • Spot serbest bakiyeler → Balance (işlem kontrolleri bunu kullanır), her çağrıda
+ *  • Fonlama / Earn / emirlerde kilitli → WalletHolding (sadece portföy değeri ve görüntüleme),
+ *    15 dakikada bir ya da { full: true } ile hemen (hesap bağlarken / "Test Et")
+ * Bakiye alınamazsa hata hesap kartında görünsün diye errorMessage'a yazılır.
+ */
+export async function syncLiveBalances(conn, { full = false } = {}) {
   if (conn.mode !== 'live') return
-  const rows = await callAdapter(conn.provider, 'fetchBalances', decrypt(conn.credentialsEnc), conn.testnet)
+  const creds = decrypt(conn.credentialsEnc)
+  let rows
+  try {
+    rows = await callAdapter(conn.provider, 'fetchBalances', creds, conn.testnet)
+  } catch (e) {
+    await prisma.exchangeAccount.update({ where: { id: conn.id }, data: { errorMessage: `${SYNC_ERR}${e.message}`.slice(0, 500) } }).catch(() => {})
+    emitTrading(conn.userId, 'exchanges')
+    throw e
+  }
   await prisma.$transaction([
     prisma.balance.deleteMany({ where: { exchangeId: conn.id } }),
-    prisma.balance.createMany({ data: rows.map((r) => ({ exchangeId: conn.id, asset: r.asset, free: r.free })) }),
-    prisma.exchangeAccount.update({ where: { id: conn.id }, data: { lastSyncAt: new Date() } }),
+    prisma.balance.createMany({ data: rows.filter((r) => r.free > 0).map((r) => ({ exchangeId: conn.id, asset: r.asset, free: r.free })) }),
+    // emirlerde kilitli tutar aynı yanıttan gelir → her seferinde güncel
+    prisma.walletHolding.deleteMany({ where: { exchangeId: conn.id, wallet: 'spot_locked' } }),
+    prisma.walletHolding.createMany({ data: rows.filter((r) => r.used > 0).map((r) => ({ exchangeId: conn.id, wallet: 'spot_locked', asset: r.asset, amount: r.used })) }),
+    prisma.exchangeAccount.update({
+      where: { id: conn.id },
+      data: { lastSyncAt: new Date(), ...(conn.errorMessage?.startsWith(SYNC_ERR) ? { errorMessage: null } : {}) },
+    }),
   ])
-  emitTrading(conn.userId, 'balances')
+  if (full || !walletsAt.has(conn.id) || Date.now() - walletsAt.get(conn.id) > WALLETS_EVERY) {
+    walletsAt.set(conn.id, Date.now())
+    try {
+      const w = await callAdapter(conn.provider, 'fetchWallets', creds, conn.testnet)
+      await prisma.$transaction([
+        prisma.walletHolding.deleteMany({ where: { exchangeId: conn.id, wallet: { not: 'spot_locked' } } }),
+        prisma.walletHolding.createMany({ data: w.rows.map((r) => ({ exchangeId: conn.id, wallet: r.wallet, asset: r.asset, amount: r.amount })) }),
+      ])
+      if (w.errors?.length) log.warn({ exchange: conn.id, errors: w.errors }, 'bazı cüzdanlar okunamadı')
+    } catch (e) {
+      log.warn({ exchange: conn.id, err: e.message }, 'ek cüzdanlar okunamadı')
+    }
+  }
+  emitTrading(conn.userId, 'balances', 'exchanges')
 }

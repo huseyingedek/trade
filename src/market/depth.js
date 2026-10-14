@@ -7,7 +7,11 @@ import { hub } from '../realtime/hub.js'
 import { gauss, roundTo } from '../lib/num.js'
 import { badRequest, notFound } from '../lib/errors.js'
 
-export const INTERVALS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400 }
+export const INTERVALS = { '1m': 60, '5m': 300, '15m': 900, '1h': 3600, '4h': 14400, '1d': 86400, '1w': 604800 }
+const WEEK = 604800
+const MONDAY_OFFSET = 4 * 86400 // 1 Ocak 1970 perşembe; haftalık mumlar (Binance) pazartesi 00:00 UTC'de açılır
+/** Mumun başlangıç zamanı (sn): haftalıkta pazartesiye hizalı */
+export const bucketStart = (t, sec) => (sec === WEEK ? Math.floor((t - MONDAY_OFFSET) / WEEK) * WEEK + MONDAY_OFFSET : Math.floor(t / sec) * sec)
 const candleCache = new Map() // key → { bars, at, live }
 const bookCache = new Map() // symbol → { book, at }
 const tradeCache = new Map() // symbol → { list, at, lastId }
@@ -23,7 +27,7 @@ const liveSource = (i) => feed.usesExternal(i) && feed.ccxtOk
 function simHistory(i, sec, limit) {
   const sigma = Math.min(i.volatility * Math.sqrt(sec) * 0.12, 0.03)
   const now = Math.floor(Date.now() / 1000)
-  const lastT = Math.floor(now / sec) * sec
+  const lastT = bucketStart(now, sec)
   const closes = [feed.last(i.symbol)]
   for (let k = 1; k < limit; k++) closes.unshift(closes[0] / (1 + gauss() * sigma + sigma * 0.02))
   return closes.map((c, k) => {
@@ -46,7 +50,9 @@ export async function getCandles(symbol, interval = '1h', limit = 300) {
   limit = Math.min(Math.max(+limit || 300, 10), 1000)
   const key = `${symbol}:${interval}`
   const cached = candleCache.get(key)
-  if (cached && Date.now() - cached.at < 30_000 && cached.bars.length >= Math.min(limit, 50)) return cached.bars.slice(-limit)
+  // önbellek yeterliyse kullan: istenen kadar mum alınmışsa ya da kaynakta zaten daha fazlası yoksa (tüm geçmiş)
+  const enough = cached && (cached.fetched >= limit || cached.bars.length < (cached.fetched || 0) || cached.bars.length >= limit)
+  if (cached && Date.now() - cached.at < 30_000 && enough) return cached.bars.slice(-limit)
 
   let bars = null
   let live = false
@@ -60,7 +66,7 @@ export async function getCandles(symbol, interval = '1h', limit = 300) {
     }
   }
   if (!bars?.length) bars = cached && !cached.live ? cached.bars : simHistory(i, sec, limit)
-  candleCache.set(key, { bars, at: Date.now(), live })
+  candleCache.set(key, { bars, at: Date.now(), live, fetched: limit })
   return bars.slice(-limit)
 }
 
@@ -74,7 +80,7 @@ export function tickCandles() {
     const price = feed.state.get(symbol)?.last
     if (!price) continue
     const bars = entry.bars
-    const t = Math.floor(now / sec) * sec
+    const t = bucketStart(now, sec)
     let bar = bars[bars.length - 1]
     if (bar.time === t) {
       bar.close = price
@@ -186,4 +192,44 @@ export function warmCandleChannels() {
     const interval = key.slice(idx + 1)
     if (feed.instrument(symbol) && INTERVALS[interval]) getCandles(symbol, interval).catch(() => {})
   }
+}
+
+// ------------------------------------------------------------------ istatistikler
+const statsCache = new Map() // symbol → { at, data }
+
+/** Bir sembolün uzun dönem istatistikleri: tüm zamanların en yüksek/düşük, 52 hafta aralığı, dönem getirileri */
+export async function getMarketStats(symbol) {
+  const i = instrumentOr404(symbol)
+  const hit = statsCache.get(i.symbol)
+  if (hit && Date.now() - hit.at < 15 * 60_000) return hit.data
+  const [weekly, daily] = await Promise.all([getCandles(i.symbol, '1w', 1000), getCandles(i.symbol, '1d', 400)])
+  const live = !!candleCache.get(`${i.symbol}:1d`)?.live
+  const price = feed.state.get(i.symbol)?.last ?? daily.at(-1)?.close
+  const extreme = (bars, pick, cmp) => bars.reduce((best, b) => (best == null || cmp(pick(b), pick(best)) ? b : best), null)
+  const athBar = extreme(weekly, (b) => b.high, (a, b) => a > b)
+  const atlBar = extreme(weekly, (b) => b.low, (a, b) => a < b)
+  const ath = Math.max(athBar?.high ?? 0, price)
+  const yearBars = daily.slice(-365)
+  const changeOver = (days) => {
+    const b = daily.length > days ? daily[daily.length - 1 - days] : null
+    return b ? ((price - b.close) / b.close) * 100 : null
+  }
+  const data = {
+    symbol: i.symbol,
+    price,
+    ath,
+    athTime: ath === price ? Math.floor(Date.now() / 1000) : athBar?.time ?? null,
+    fromAthPct: ath ? ((price - ath) / ath) * 100 : null,
+    atl: atlBar?.low ?? null,
+    atlTime: atlBar?.time ?? null,
+    fromAtlPct: atlBar?.low ? ((price - atlBar.low) / atlBar.low) * 100 : null,
+    high52w: yearBars.length ? Math.max(...yearBars.map((b) => b.high)) : null,
+    low52w: yearBars.length ? Math.min(...yearBars.map((b) => b.low)) : null,
+    changes: { '7d': changeOver(7), '30d': changeOver(30), '90d': changeOver(90), '1y': changeOver(365) },
+    since: weekly[0]?.time ?? null,
+    live, // false → simülasyon verisi (BIST/forex ya da kaynak yok)
+  }
+  if (statsCache.size > 500) statsCache.delete(statsCache.keys().next().value)
+  statsCache.set(i.symbol, { at: Date.now(), data })
+  return data
 }

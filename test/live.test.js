@@ -27,11 +27,16 @@ const SYM = 'BTC/USDT'
 // ---- sahte borsa
 let ex
 function resetEx() {
-  ex = { free: { USDT: 1000, BTC: 0 }, orders: new Map(), seq: 0, calls: [], feeInBnb: false }
+  ex = { free: { USDT: 1000, BTC: 0 }, used: {}, wallets: [], walletErrors: [], failBalance: null, orders: new Map(), seq: 0, calls: [], feeInBnb: false }
 }
 function mockAdapter() {
   ccxtAdapter.test = async () => ({ ok: true, latencyMs: 1, permissions: ['read', 'spot'], info: 'mock' })
-  ccxtAdapter.fetchBalances = async () => Object.entries(ex.free).filter(([, v]) => v > 0).map(([asset, free]) => ({ asset, free }))
+  ccxtAdapter.fetchBalances = async () => {
+    if (ex.failBalance) throw ex.failBalance
+    const assets = new Set([...Object.keys(ex.free), ...Object.keys(ex.used)])
+    return [...assets].map((asset) => ({ asset, free: ex.free[asset] || 0, used: ex.used[asset] || 0 })).filter((r) => r.free > 0 || r.used > 0)
+  }
+  ccxtAdapter.fetchWallets = async () => ({ rows: ex.wallets, errors: ex.walletErrors })
   ccxtAdapter.freeBalance = async (_p, _c, _t, asset) => ex.free[asset] ?? 0
   ccxtAdapter.createOrder = async (_p, _c, _t, { symbol, side, type, qty, price }) => {
     ex.calls.push({ side, type, qty, price })
@@ -308,4 +313,41 @@ test('canlı: sadece emir kimliği dönen borsa (OKX/Bybit) – dolum borsadan t
   } finally {
     mockAdapter()
   }
+})
+
+test('Fonlama / Earn / emirde kilitli varlıklar portföy değerine girer ama işlemde kullanılamaz', { skip }, async () => {
+  const { syncLiveBalances } = await import('../src/trading/orders.js')
+  const { summary } = await import('../src/trading/portfolio.js')
+  ex.free = { USDT: 100 }
+  ex.used = { USDT: 50 } // açık emirde
+  ex.wallets = [{ wallet: 'funding', asset: 'USDT', amount: 300 }, { wallet: 'earn_flexible', asset: 'BTC', amount: 0.01 }]
+  const { user, conn } = await makeLiveUser()
+  await syncLiveBalances(conn, { full: true })
+  const s = await summary(user.id, 'live')
+  // 100 serbest + 50 emirde + 300 fonlama + 0.01 BTC × 50.000 = 950
+  near(s.totalValue, 950)
+  near(s.byExchange.find((e) => e.exchangeId === conn.id).value, 950)
+  // işlem kontrolü yalnızca Spot serbest bakiyeyi görür: 100 USDT'lik alım sınırı
+  await assert.rejects(placeOrder(user.id, { exchangeId: conn.id, symbol: SYM, side: 'buy', type: 'market', qty: 0.004 }), /Yetersiz bakiye: borsa hesabınızda 100/)
+  assert.equal(ex.calls.length, 0)
+  // ek cüzdan okunamazsa eski kayıtlar korunur (değer aniden düşmez)
+  ex.wallets = null
+  ccxtAdapter.fetchWallets = async () => { throw new Error('ağ hatası') }
+  await syncLiveBalances({ ...conn }, { full: true })
+  near((await summary(user.id, 'live')).totalValue, 950)
+  mockAdapter()
+})
+
+test('bakiye alınamazsa hata hesap kartına yazılır, sonraki başarılı senkronda temizlenir', { skip }, async () => {
+  const { syncLiveBalances } = await import('../src/trading/orders.js')
+  const { user, conn } = await makeLiveUser()
+  void user
+  ex.failBalance = new Error('Invalid API-key, IP, or permissions for action')
+  await assert.rejects(syncLiveBalances(conn))
+  let c = await prisma.exchangeAccount.findUnique({ where: { id: conn.id } })
+  assert.match(c.errorMessage, /^Bakiye alınamadı: /)
+  ex.failBalance = null
+  await syncLiveBalances(c)
+  c = await prisma.exchangeAccount.findUnique({ where: { id: conn.id } })
+  assert.equal(c.errorMessage, null)
 })

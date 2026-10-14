@@ -17,7 +17,7 @@
     "db:reset": "prisma migrate reset --force",
     "db:studio": "prisma studio",
     "setup": "npm run db:generate && npm run db:deploy && npm run db:seed",
-    "test": "node --test test/lib.test.js",
+    "test": "node --test test/lib.test.js test/backtest.test.js test/analysis.test.js test/market.test.js",
     "init": "node scripts/init-env.js",
     "smoke": "node --env-file-if-exists=.env scripts/smoke.js",
     "postinstall": "prisma generate",

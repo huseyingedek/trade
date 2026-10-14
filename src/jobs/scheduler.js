@@ -13,6 +13,7 @@ import { processOrders, processProtection, pollLiveOrders } from '../trading/eng
 import { syncLiveBalances } from '../trading/orders.js'
 import { syncCryptoCatalog } from '../market/catalog.js'
 import { checkDailyLoss } from '../trading/risk.js'
+import { recordSignals, evaluateSignals } from '../analysis/index.js'
 import { processRules } from '../automation/rules.js'
 import { processBots } from '../automation/bots.js'
 import { summary, totalValueUsd, ensureDayStart } from '../trading/portfolio.js'
@@ -121,6 +122,14 @@ export function startJobs() {
     every(24 * 60 * 60_000, 'catalog', runCatalog)
   }
   every(60 * 60_000, 'cleanup', cleanup)
+  // Analiz merkezi karnesi: günlük teknik görünüm kaydı + vadesi gelenlerin sonucu
+  const runAnalysis = async () => {
+    const added = await recordSignals()
+    const done = await evaluateSignals()
+    if (added || done) log.info(`📊 analiz karnesi: ${added} yeni kayıt, ${done} sonuç güncellendi`)
+  }
+  setTimeout(() => runAnalysis().catch((e) => log.warn(`analiz karnesi: ${e.message}`)), 60_000)
+  every(30 * 60_000, 'analysis', runAnalysis)
   if (config.LIVE_TRADING_ENABLED) {
     every(5000, 'liveOrders', pollLiveOrders)
     // canlı hesap bakiyeleri (borsaya dışarıdan yatırılan / çekilen para) – 2 dakikada bir

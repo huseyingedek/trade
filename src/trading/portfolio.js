@@ -54,11 +54,13 @@ const modeFilter = (mode) => (mode === 'live' ? { mode: 'live' } : mode === 'pap
  */
 export async function loadHoldings(userId, mode) {
   const ex = modeFilter(mode)
-  const [balances, positions] = await Promise.all([
+  const [balances, positions, wallets] = await Promise.all([
     prisma.balance.findMany({ where: { exchange: { userId, ...ex } }, include: { exchange: { select: { id: true, market: true, mode: true } } } }),
     prisma.position.findMany({ where: { userId, ...(mode ? { exchange: ex } : {}) }, include: { exchange: { select: { mode: true } } } }),
+    // canlı hesaplarda Spot dışı varlıklar (Fonlama / Earn / emirlerde kilitli) – sanal modda yok
+    mode === 'paper' ? [] : prisma.walletHolding.findMany({ where: { exchange: { userId, mode: 'live' } }, include: { exchange: { select: { id: true, market: true, mode: true } } } }),
   ])
-  return { balances, positions }
+  return { balances, positions, wallets }
 }
 
 /** Risk takibinin yapılacağı mod: kullanıcının canlı hesabı varsa gerçek para, yoksa sanal */
@@ -71,12 +73,20 @@ export async function riskScope(userId) {
  * Canlı hesaplar: borsadan gelen tüm bakiyeler (coinler dahil) zaten varlığın tamamıdır;
  * pozisyonlar sadece K/Z takibi içindir, tekrar eklenmez.
  */
-export function valueOf({ balances, positions }) {
+export function valueOf({ balances, positions, wallets = [] }) {
   let total = 0
   for (const b of balances) total += assetToUsd(num(b.free), b.asset)
+  for (const w of wallets) total += assetToUsd(num(w.amount), w.asset)
   for (const p of positions) if (p.exchange?.mode !== 'live') total += feed.toUsd(positionMetrics(p).value, quoteOf(p.symbol))
   return total
 }
+
+/**
+ * Yüzde hesabı için anlamlı en küçük gün başı değeri (USD). Bunun altında (ör. 0,001 $ toz bakiye)
+ * yüzde değişim anlamsızdır (%14.000 gibi) ve günlük zarar limitini yanlışlıkla tetikleyebilir.
+ */
+export const MIN_PCT_BASE_USD = 10
+export const dayPct = (total, start) => (start >= MIN_PCT_BASE_USD ? ((total - start) / start) * 100 : 0)
 
 export async function totalValueUsd(userId, mode) {
   return valueOf(await loadHoldings(userId, mode))
@@ -128,7 +138,7 @@ export async function summary(userId, mode) {
   const allocation = { crypto: 0, bist: 0, forex: 0, cash: 0 }
   const byExchange = {}
   let unrealized = 0
-  for (const b of h.balances) {
+  for (const b of [...h.balances, ...h.wallets.map((w) => ({ ...w, free: w.amount }))]) {
     const v = assetToUsd(num(b.free), b.asset)
     if (isCashAsset(b.asset)) allocation.cash += v
     else allocation[b.exchange?.market || 'crypto'] += v
@@ -155,7 +165,7 @@ export async function summary(userId, mode) {
     positionsValue: total - allocation.cash,
     unrealizedPnl: unrealized,
     dayPnl: total - dayStart,
-    dayPnlPct: dayStart ? ((total - dayStart) / dayStart) * 100 : 0,
+    dayPnlPct: dayPct(total, dayStart),
     allocation: [
       { key: 'crypto', label: 'Kripto', value: allocation.crypto },
       { key: 'bist', label: 'BIST', value: allocation.bist },

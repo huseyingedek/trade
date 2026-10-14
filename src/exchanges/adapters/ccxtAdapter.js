@@ -107,9 +107,70 @@ export const ccxtAdapter = {
   async fetchBalances(provider, creds, testnet) {
     const ex = client(provider, creds, testnet)
     const bal = await ex.fetchBalance()
-    return Object.entries(bal.free || {})
-      .filter(([, v]) => v > 0)
-      .map(([asset, free]) => ({ asset, free }))
+    // free: serbest (işlemde kullanılabilir) · used: açık emirlerde kilitli
+    const assets = new Set([...Object.keys(bal.free || {}), ...Object.keys(bal.used || {})])
+    return [...assets]
+      .map((asset) => ({ asset, free: +(bal.free?.[asset] ?? 0), used: +(bal.used?.[asset] ?? 0) }))
+      .filter((r) => r.free > 0 || r.used > 0)
+  },
+
+  /**
+   * Spot DIŞINDAKİ varlıklar (yalnızca görüntüleme / portföy değeri için):
+   *  (Spot'ta emirlerde kilitli tutar fetchBalances'tan gelir – her senkronizasyonda güncellenir)
+   *  • funding       – Binance Fonlama cüzdanı ("Kripto Satın Al", P2P, kartla alımlar çoğunlukla buraya düşer)
+   *  • earn_flexible / earn_locked – Binance Simple Earn
+   *  • futures       – Binance USDⓈ-M vadeli cüzdan bakiyesi
+   * Her kaynak ayrı denenir; biri başarısız olursa diğerleri yine döner. Hata listesi `errors` içinde.
+   */
+  async fetchWallets(provider, creds, testnet) {
+    const ex = client(provider, creds, testnet)
+    const rows = []
+    const errors = []
+    const add = (wallet, asset, amount) => {
+      const n = +amount
+      if (asset && n > 0) rows.push({ wallet, asset: String(asset).toUpperCase(), amount: n })
+    }
+    if (provider.ccxtId === 'binance' && !testnet) {
+      try {
+        const f = await ex.fetchBalance({ type: 'funding' })
+        for (const [asset, total] of Object.entries(f.total || {})) add('funding', asset, total)
+      } catch (e) {
+        errors.push(`funding: ${humanizeCcxtError(e)}`)
+      }
+      // Simple Earn – sayfalı (en fazla 100'er), birkaç sayfa yeter
+      const earn = async (method, wallet, field) => {
+        for (let page = 1; page <= 5; page++) {
+          const r = await ex[method]({ current: page, size: 100 })
+          const list = r?.rows || []
+          for (const x of list) add(wallet, x.asset, x[field])
+          if (list.length < 100) break
+        }
+      }
+      try {
+        // USDⓈ-M vadeli cüzdan (teminat bakiyesi). Anahtarda vadeli izni yoksa hata → atlanır
+        const fut = await ex.fetchBalance({ type: 'future' })
+        for (const [asset, total] of Object.entries(fut.total || {})) add('futures', asset, total)
+      } catch (e) {
+        errors.push(`futures: ${humanizeCcxtError(e)}`)
+      }
+      try {
+        await earn('sapiGetSimpleEarnFlexiblePosition', 'earn_flexible', 'totalAmount')
+      } catch (e) {
+        errors.push(`earn: ${humanizeCcxtError(e)}`)
+      }
+      try {
+        await earn('sapiGetSimpleEarnLockedPosition', 'earn_locked', 'amount')
+      } catch (e) {
+        errors.push(`earn_locked: ${humanizeCcxtError(e)}`)
+      }
+    }
+    // aynı cüzdan + varlık birden çok satırda gelebilir (ör. farklı Earn ürünleri) → topla
+    const merged = new Map()
+    for (const r of rows) {
+      const k = `${r.wallet}|${r.asset}`
+      merged.set(k, { ...r, amount: (merged.get(k)?.amount || 0) + r.amount })
+    }
+    return { rows: [...merged.values()], errors }
   },
 
   /** Tek varlığın serbest bakiyesi (satıştan hemen önce) */

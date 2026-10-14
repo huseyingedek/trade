@@ -14,6 +14,7 @@ import { placeOrder } from '../trading/orders.js'
 import { getPlatform } from '../services/platform.js'
 import { ACCOUNT_CCY, providerById } from '../exchanges/providers.js'
 import { log } from '../lib/logger.js'
+import { STEPS, unrealized, trailingStop } from './strategies.js'
 
 const STATUS_TR = { running: 'başlatıldı', paused: 'duraklatıldı', stopped: 'durduruldu' }
 
@@ -44,7 +45,9 @@ async function validate(userId, body) {
     config = { amount: +c.amount, intervalHours: +c.intervalHours, takeProfitPct: +c.takeProfitPct || 0, maxOrders: Math.round(+c.maxOrders) || 10 }
   } else {
     if (!(+c.trailingPct > 0 && +c.trailingPct <= 50)) throw badRequest('İz mesafesi %0–50 arasında olmalı')
-    config = { trailingPct: +c.trailingPct, takeProfitPct: +c.takeProfitPct || null }
+    const be = c.breakEvenPct === undefined || c.breakEvenPct === null || c.breakEvenPct === '' ? null : +c.breakEvenPct
+    if (be !== null && !(be >= 0 && be <= 50)) throw badRequest('Başa baş koruması %0–50 arasında olmalı')
+    config = { trailingPct: +c.trailingPct, takeProfitPct: +c.takeProfitPct || null, breakEvenPct: be || null }
   }
   // Emir başına tutar borsanın en küçük miktar adımından küçükse bot hiç işlem yapamaz
   const perOrder = body.strategy === 'grid' ? inv / config.grids : body.strategy === 'dca' ? config.amount : inv
@@ -131,7 +134,10 @@ export async function getBotDetail(userId, id) {
     const peak = s.peak ?? null
     Object.assign(view, {
       qty: s.qty || 0, entryPrice: s.entry ?? null, peak,
-      stopPrice: peak ? peak * (1 - c.trailingPct / 100) : null,
+      stopPrice: trailingStop(c, s),
+      breakEvenPct: c.breakEvenPct || null,
+      breakEvenArmed: !!s.beArmed,
+      breakEvenTrigger: s.entry && c.breakEvenPct ? s.entry * (1 + c.breakEvenPct / 100) : null,
       takeProfitPrice: s.entry && c.takeProfitPct ? s.entry * (1 + c.takeProfitPct / 100) : null,
       done: !!s.done,
     })
@@ -191,95 +197,6 @@ async function trade(b, s, side, qty) {
   return { qty: o.filledQty || qty, price: o.avgPrice || feed.last(b.symbol) }
 }
 
-async function stepDca(b, s, price) {
-  const c = b.config
-  s.qty ??= 0
-  s.cost ??= 0
-  s.buys ??= 0
-  s.realized ??= 0
-  const avg = s.qty ? s.cost / s.qty : 0
-  if (s.qty > 0 && c.takeProfitPct && price >= avg * (1 + c.takeProfitPct / 100)) {
-    const f = await trade(b, s, 'sell', s.qty)
-    if (f) {
-      s.realized += f.qty * f.price - s.cost
-      Object.assign(s, { qty: 0, cost: 0, buys: 0 })
-      return `Kâr alındı: ${f.qty} @ ${f.price}`
-    }
-  }
-  const due = !s.lastBuyAt || Date.now() - s.lastBuyAt >= c.intervalHours * 3_600_000
-  if (due && s.buys < c.maxOrders && s.cost + c.amount <= num(b.investment) + 1e-9) {
-    const f = await trade(b, s, 'buy', c.amount / price)
-    if (f) {
-      s.qty += f.qty
-      s.cost += f.qty * f.price
-      s.buys++
-      s.lastBuyAt = Date.now()
-      return `Alım: ${f.qty} @ ${f.price}`
-    }
-  }
-  return null
-}
-
-async function stepGrid(b, s, price) {
-  const { lower, upper, grids } = b.config
-  const step = (upper - lower) / grids
-  s.holdings ??= {}
-  s.realized ??= 0
-  const prev = s.lastPrice ?? price
-  s.lastPrice = price
-  if (price < lower || price > upper) return null
-  const perGrid = num(b.investment) / grids
-  let msg = null
-  for (let k = 0; k < grids; k++) {
-    const buyLevel = lower + k * step
-    const sellLevel = buyLevel + step
-    if (!s.holdings[k] && prev > buyLevel && price <= buyLevel) {
-      const f = await trade(b, s, 'buy', perGrid / price)
-      if (f) {
-        s.holdings[k] = { qty: f.qty, price: f.price }
-        msg = `Grid alım (seviye ${k + 1}): ${f.qty} @ ${f.price}`
-      }
-    } else if (s.holdings[k] && prev < sellLevel && price >= sellLevel) {
-      const h = s.holdings[k]
-      const f = await trade(b, s, 'sell', h.qty)
-      if (f) {
-        s.realized += (f.price - h.price) * f.qty
-        delete s.holdings[k]
-        msg = `Grid satış (seviye ${k + 1}): ${f.qty} @ ${f.price}`
-      }
-    }
-  }
-  return msg
-}
-
-async function stepTrailing(b, s, price) {
-  const c = b.config
-  s.realized ??= 0
-  if (!s.qty && !s.done) {
-    const f = await trade(b, s, 'buy', num(b.investment) / price)
-    if (f) Object.assign(s, { qty: f.qty, entry: f.price, peak: f.price })
-    return f ? `Pozisyon açıldı: ${f.qty} @ ${f.price}` : null
-  }
-  if (!s.qty) return null
-  s.peak = Math.max(s.peak, price)
-  const hitTp = c.takeProfitPct && price >= s.entry * (1 + c.takeProfitPct / 100)
-  if (price <= s.peak * (1 - c.trailingPct / 100) || hitTp) {
-    const f = await trade(b, s, 'sell', s.qty)
-    if (f) {
-      s.realized += (f.price - s.entry) * f.qty
-      Object.assign(s, { qty: 0, done: true })
-      return `${hitTp ? 'Hedef kâr' : 'İz süren stop'} ile kapatıldı @ ${f.price}`
-    }
-  }
-  return null
-}
-
-function unrealized(b, s, price) {
-  if (b.strategy === 'dca') return (s.qty || 0) * price - (s.cost || 0)
-  if (b.strategy === 'grid') return Object.values(s.holdings || {}).reduce((a, h) => a + (price - h.price) * h.qty, 0)
-  return s.qty ? (price - s.entry) * s.qty : 0
-}
-
 let busy = false
 export async function processBots() {
   if (busy) return
@@ -297,9 +214,8 @@ export async function processBots() {
       let msg = null
       let status = b.status
       try {
-        if (b.strategy === 'dca') msg = await stepDca(b, s, price)
-        else if (b.strategy === 'grid') msg = await stepGrid(b, s, price)
-        else msg = await stepTrailing(b, s, price)
+        const step = STEPS[b.strategy] || STEPS.trailing
+        msg = await step(b, s, price, { trade: (side, qty) => trade(b, s, side, qty), now: Date.now() })
         s.failures = 0
         if (b.strategy === 'trailing' && s.done) status = 'stopped'
       } catch (e) {

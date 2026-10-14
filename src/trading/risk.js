@@ -4,7 +4,7 @@
 import { prisma } from '../lib/prisma.js'
 import { dayKey } from '../lib/time.js'
 import { badRequest } from '../lib/errors.js'
-import { totalValueUsd, ensureDayStart, setDayStart, riskScope } from './portfolio.js'
+import { totalValueUsd, ensureDayStart, setDayStart, riskScope, dayPct, MIN_PCT_BASE_USD } from './portfolio.js'
 import { cancelAll, closePosition, emitTrading } from './orders.js'
 import { logActivity } from '../services/activity.js'
 
@@ -17,7 +17,7 @@ export async function riskState(userId) {
   const total = await totalValueUsd(userId, scope)
   const start = (await ensureDayStart(userId, total, scope)) || total
   const r = await getRisk(userId)
-  const pct = start ? ((total - start) / start) * 100 : 0
+  const pct = dayPct(total, start)
   const [openOrders, runningBots, activeRules] = await Promise.all([
     prisma.order.count({ where: { userId, status: 'open' } }),
     prisma.bot.count({ where: { userId, status: 'running' } }),
@@ -108,7 +108,8 @@ export async function checkDailyLoss() {
     if (!d || d.key !== dayKey()) continue
     const scope = await riskScope(r.userId)
     const start = d[scope]
-    if (!(start > 0)) continue
+    // toz bakiyede (gün başı < 10 $) yüzde anlamsız → limit uygulanmaz
+    if (!(start >= MIN_PCT_BASE_USD)) continue
     const total = await totalValueUsd(r.userId, scope)
     const pct = ((total - start) / start) * 100
     if (pct <= -Math.abs(r.dailyLossPct)) await setKillSwitch(r.userId, { active: true, reason: `Günlük zarar limiti (%${r.dailyLossPct}) aşıldı`, cancelOrders: true }, 'risk')

@@ -328,6 +328,7 @@ model ExchangeAccount {
   updatedAt      DateTime         @updatedAt
   user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   balances       Balance[]
+  walletHoldings WalletHolding[]
   positions      Position[]
   orders         Order[]
   rules          Rule[]
@@ -366,6 +367,21 @@ model Balance {
   exchange   ExchangeAccount @relation(fields: [exchangeId], references: [id], onDelete: Cascade)
 
   @@unique([exchangeId, asset])
+}
+
+/// Canlı borsa hesabında Spot DIŞINDAKİ varlıklar (Fonlama cüzdanı, Earn, emirlerde kilitli).
+/// Sadece portföy değeri ve görüntüleme içindir; işlem kontrolleri Balance (Spot serbest) üzerinden yapılır.
+model WalletHolding {
+  id         String          @id @default(cuid())
+  exchangeId String
+  /// funding | earn_flexible | earn_locked | spot_locked
+  wallet     String
+  asset      String
+  amount     Decimal         @db.Decimal(36, 12)
+  updatedAt  DateTime        @updatedAt
+  exchange   ExchangeAccount @relation(fields: [exchangeId], references: [id], onDelete: Cascade)
+
+  @@unique([exchangeId, wallet, asset])
 }
 
 model Position {
@@ -516,6 +532,28 @@ model PortfolioSnapshot {
   user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, ts])
+}
+
+// ------------------------------------------------------------------ analiz merkezi
+/// Teknik görünüm kayıtları (günde sembol + vade başına bir tane). "Karne" için
+/// 1/7/30 gün sonraki fiyat değişimi doldurulur → sistemin geçmiş isabeti ölçülür.
+model AnalysisSignal {
+  id        String   @id @default(cuid())
+  symbol    String
+  /// short | long
+  horizon   String
+  /// YYYY-MM-DD (UTC)
+  day       String
+  score     Int
+  label     String
+  price     Float
+  createdAt DateTime @default(now())
+  ret1d     Float?
+  ret7d     Float?
+  ret30d    Float?
+
+  @@unique([symbol, horizon, day])
+  @@index([createdAt])
 }
 
 model Activity {

@@ -96,10 +96,10 @@ export async function createConnection(userId, { provider: providerId, label, cr
     await prisma.balance.create({ data: { exchangeId: c.id, asset: acct, free: feed.convert(usd, 'USD', acct) } })
     await adjustDayStart(userId, usd, 'paper')
   } else {
-    await syncLiveBalances(c).catch(() => {})
+    await syncLiveBalances(c, { full: true }).catch(() => {})
     // yeni bağlanan gerçek hesabın bakiyesi "bugünkü kâr" sayılmasın
     const h = await loadHoldings(userId, 'live')
-    await adjustDayStart(userId, valueOf({ balances: h.balances.filter((b) => b.exchangeId === c.id), positions: [] }), 'live')
+    await adjustDayStart(userId, valueOf({ balances: h.balances.filter((b) => b.exchangeId === c.id), positions: [], wallets: h.wallets.filter((w) => w.exchangeId === c.id) }), 'live')
   }
   await logActivity(userId, { level: 'success', source: 'system', notify: true, exchangeId: c.id, message: `${provider.name} hesabı bağlandı: ${c.label} (${c.mode === 'paper' ? 'paper / sanal' : 'canlı'})` })
   hub.toUser(userId, 'exchanges')
@@ -126,9 +126,20 @@ export async function testConnection(userId, id) {
       ? { status: 'connected', errorMessage: null, latencyMs: res.latencyMs, lastSyncAt: new Date(), permissions: res.permissions }
       : { status: c.mode === 'live' || authFail ? 'error' : c.status, errorMessage: res.message },
   })
-  if (res.ok && c.mode === 'live') await syncLiveBalances(u).catch(() => {})
+  let info = res.info
+  if (res.ok && c.mode === 'live') {
+    // tanı: hangi cüzdanda kaç varlık bulundu (kullanıcı "bakiyem görünmüyor" derse nedeni hemen görülsün)
+    try {
+      await syncLiveBalances(u, { full: true })
+      const [spot, wallets] = await Promise.all([prisma.balance.count({ where: { exchangeId: id } }), prisma.walletHolding.groupBy({ by: ['wallet'], where: { exchangeId: id }, _count: true })])
+      const n = (w) => wallets.filter((x) => w.includes(x.wallet)).reduce((a, x) => a + x._count, 0)
+      info = `Spot: ${spot} · Fonlama: ${n(['funding'])} · Earn: ${n(['earn_flexible', 'earn_locked'])} · Vadeli: ${n(['futures'])} varlık`
+    } catch (e) {
+      info = `Bağlantı tamam ama bakiye alınamadı: ${e.message}`
+    }
+  }
   hub.toUser(userId, 'exchanges')
-  return res.ok ? { ok: true, latencyMs: res.latencyMs, permissions: res.permissions, info: res.info } : { ok: false, message: res.message }
+  return res.ok ? { ok: true, latencyMs: res.latencyMs, permissions: res.permissions, info } : { ok: false, message: res.message }
 }
 
 export async function updateConnection(userId, id, patch, source = 'manual') {
@@ -173,7 +184,7 @@ export async function deleteConnection(userId, id) {
   }
   const h = await loadHoldings(userId)
   // silinen hesabın nakit + (sanal hesapta) açık pozisyon değeri: hesapla birlikte silinir, "zarar" sayılmamalı
-  const removedUsd = valueOf({ balances: h.balances.filter((b) => b.exchangeId === id), positions: h.positions.filter((p) => p.exchangeId === id) })
+  const removedUsd = valueOf({ balances: h.balances.filter((b) => b.exchangeId === id), positions: h.positions.filter((p) => p.exchangeId === id), wallets: h.wallets.filter((w) => w.exchangeId === id) })
   await prisma.exchangeAccount.delete({ where: { id } })
   await adjustDayStart(userId, -removedUsd, c.mode === 'live' ? 'live' : 'paper')
   await logActivity(userId, { level: 'warning', message: `${c.label} bağlantısı kaldırıldı` })
