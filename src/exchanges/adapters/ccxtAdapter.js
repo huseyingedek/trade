@@ -7,6 +7,7 @@ import { createHash } from 'node:crypto'
 // borsanın IP başına istek kotasını tüketiyordu. İstemciler anahtar başına, piyasa listesi
 // borsa başına önbellekte tutulur.
 const CLIENT_TTL = 30 * 60_000
+const MAX_CLIENTS = 100
 const MARKETS_TTL = 6 * 60 * 60_000
 const clients = new Map() // key → { ex, at }
 const marketsCache = new Map() // providerId:testnet → { markets, at, promise }
@@ -25,6 +26,12 @@ function client(provider, creds = {}, testnet = false) {
     timeout: 15000,
     options: { adjustForTimeDifference: true, recvWindow: 10000 },
   })
+  // BELLEK: anahtarlı istemcide loadMarkets, Binance'in tüm coin/ağ listesini (capital/config/getall,
+  // megabaytlarca JSON) de indirir. Buna ihtiyacımız yok; 512 MB'lık sunucuda bellek taşmasına yol açıyordu.
+  ex.options.fetchCurrencies = false
+  // piyasa listesi daha önce yüklendiyse paylaşılan kopyayı kullan (her kullanıcı için ayrı indirme yok)
+  const shared = marketsCache.get(`${provider.id}:${testnet ? 1 : 0}`)?.markets
+  if (shared) ex.setMarkets(shared)
   if (provider.ccxtId === 'binance') {
     // sadece spot: vadeli/opsiyon piyasalarını yüklemek gereksiz istek demek
     ex.options.fetchMarkets = ['spot']
@@ -34,7 +41,9 @@ function client(provider, creds = {}, testnet = false) {
     if (!ex.urls?.test) throw new Error(`${provider.name} için test ağı desteklenmiyor`)
     ex.setSandboxMode(true)
   }
-  if (clients.size > 500) clients.delete(clients.keys().next().value)
+  // her istemci ~0,5 MB bellek: süresi dolanları at, toplamı sınırla (en eskisi gider)
+  for (const [k, v] of clients) if (Date.now() - v.at >= CLIENT_TTL) clients.delete(k)
+  while (clients.size >= MAX_CLIENTS) clients.delete(clients.keys().next().value)
   clients.set(key, { ex, at: Date.now() })
   return ex
 }
@@ -70,6 +79,19 @@ export function humanizeCcxtError(e) {
   return e.message?.slice(0, 200) || 'Bilinmeyen borsa hatası'
 }
 
+const isBinance = (provider) => provider.ccxtId === 'binance'
+
+/**
+ * Binance Spot bakiyeleri – doğrudan /api/v3/account (piyasa listesi YÜKLENMEZ).
+ * ccxt fetchBalance önce loadMarkets çağırıyor; binlerce paritelik listeyi sadece bakiye için
+ * belleğe açmak sunucuyu çökertiyordu.
+ */
+async function binanceSpot(ex) {
+  const acc = await ex.privateGetAccount({ omitZeroBalances: true })
+  const rows = (acc?.balances || []).map((b) => ({ asset: String(b.asset).toUpperCase(), free: +b.free || 0, used: +b.locked || 0 }))
+  return { rows, canTrade: acc?.canTrade !== false }
+}
+
 const feesOf = (o) => (o?.fees?.length ? o.fees : o?.fee ? [o.fee] : [])
 
 /** Emrin komisyonu yanıtta yoksa işlemlerinden (fills) topla */
@@ -96,16 +118,24 @@ export const ccxtAdapter = {
   async test(provider, creds, testnet) {
     const ex = client(provider, creds, testnet)
     const t0 = Date.now()
-    const bal = await ex.fetchBalance()
+    let nonZero
+    if (isBinance(provider)) {
+      const { rows } = await binanceSpot(ex)
+      nonZero = rows.filter((r) => r.free + r.used > 0).length
+    } else {
+      const bal = await ex.fetchBalance()
+      nonZero = Object.entries(bal.total || {}).filter(([, v]) => v > 0).length
+    }
     const latencyMs = Date.now() - t0
     const permissions = ['read', 'spot']
     if (provider.features.futures) permissions.push('futures')
-    const nonZero = Object.entries(bal.total || {}).filter(([, v]) => v > 0).length
     return { ok: true, latencyMs, permissions, info: `${nonZero} varlık bulundu` }
   },
 
   async fetchBalances(provider, creds, testnet) {
     const ex = client(provider, creds, testnet)
+    if (isBinance(provider)) return (await binanceSpot(ex)).rows.filter((r) => r.free > 0 || r.used > 0)
+    await ensureMarkets(provider, ex, testnet) // diğer borsalar: paylaşılan piyasa listesi
     const bal = await ex.fetchBalance()
     // free: serbest (işlemde kullanılabilir) · used: açık emirlerde kilitli
     const assets = new Set([...Object.keys(bal.free || {}), ...Object.keys(bal.used || {})])
@@ -132,8 +162,9 @@ export const ccxtAdapter = {
     }
     if (provider.ccxtId === 'binance' && !testnet) {
       try {
-        const f = await ex.fetchBalance({ type: 'funding' })
-        for (const [asset, total] of Object.entries(f.total || {})) add('funding', asset, total)
+        // Fonlama cüzdanı – doğrudan uç nokta (piyasa listesi gerekmez)
+        const f = await ex.sapiPostAssetGetFundingAsset({})
+        for (const x of Array.isArray(f) ? f : []) add('funding', x.asset, (+x.free || 0) + (+x.locked || 0) + (+x.freeze || 0) + (+x.withdrawing || 0))
       } catch (e) {
         errors.push(`funding: ${humanizeCcxtError(e)}`)
       }
@@ -148,8 +179,8 @@ export const ccxtAdapter = {
       }
       try {
         // USDⓈ-M vadeli cüzdan (teminat bakiyesi). Anahtarda vadeli izni yoksa hata → atlanır
-        const fut = await ex.fetchBalance({ type: 'future' })
-        for (const [asset, total] of Object.entries(fut.total || {})) add('futures', asset, total)
+        const fut = await ex.fapiPrivateV2GetBalance({})
+        for (const x of Array.isArray(fut) ? fut : []) add('futures', x.asset, x.balance)
       } catch (e) {
         errors.push(`futures: ${humanizeCcxtError(e)}`)
       }
@@ -176,6 +207,8 @@ export const ccxtAdapter = {
   /** Tek varlığın serbest bakiyesi (satıştan hemen önce) */
   async freeBalance(provider, creds, testnet, asset) {
     const ex = client(provider, creds, testnet)
+    if (isBinance(provider)) return (await binanceSpot(ex)).rows.find((r) => r.asset === String(asset).toUpperCase())?.free ?? 0
+    await ensureMarkets(provider, ex, testnet)
     const bal = await ex.fetchBalance()
     return +(bal.free?.[asset] ?? 0)
   },
